@@ -128,7 +128,7 @@ if let i = args.firstIndex(of: "--process-test") {
     let costBefore = settings.costTotalUSD
 
     let session = Session(title: title, presetName: "Meeting",
-                          participants: ["Alex", "Tayet"], startedAt: Date(),
+                          participants: ["Alex", "Jordan"], startedAt: Date(),
                           recordedDuration: 246,
                           pauseSpans: [.init(atRecordedSeconds: 120, wallGapSeconds: 35)])
     let jobDir = jobsRoot.appendingPathComponent(session.id)

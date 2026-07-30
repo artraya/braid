@@ -28,8 +28,8 @@ the old items were deleted and the installed app wrote its own, so it now owns
 them. Verified by reading them back with no prompt. (You'll see one prompt
 again only if you reinstall a new build — click **Always Allow** that once.)
 
-**Optional:** add your jargon to **Key Terms** (one per line) — "Pangaea",
-"QuickSlope", "Geomoss", site names, colleague names. This is the single
+**Optional:** add your jargon to **Key Terms** (one per line) — "Acme Geo",
+"SlopeWatch", "Terrafix", site names, colleague names. This is the single
 highest-leverage accuracy lever in the whole pipeline.
 
 ---

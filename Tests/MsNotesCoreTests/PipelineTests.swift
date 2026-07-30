@@ -184,11 +184,11 @@ import Testing
     let body = AssemblyAIAdapter.requestBody(
         audioURL: "https://example/x", diarize: true,
         speakerRange: AssemblyAIAdapter.remoteSpeakerRange(participantCount: 2),
-        keyTerms: ["Pangaea", "QuickSlope"])
+        keyTerms: ["Acme Geo", "SlopeWatch"])
     #expect(body["language_code"] as? String == "en_au")
     #expect(body["speech_models"] as? [String] == ["universal-3-5-pro"])
     #expect(body["speaker_labels"] as? Bool == true)
-    #expect(body["keyterms_prompt"] as? [String] == ["Pangaea", "QuickSlope"])
+    #expect(body["keyterms_prompt"] as? [String] == ["Acme Geo", "SlopeWatch"])
     let options = body["speaker_options"] as? [String: Int]
     #expect(options?["min_speakers_expected"] == 1)
     #expect(options?["max_speakers_expected"] == 3)  // participants + 1
