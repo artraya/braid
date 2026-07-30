@@ -65,27 +65,41 @@ if let i = args.firstIndex(of: "--record-test") {
 }
 
 if let i = args.firstIndex(of: "--import-keys") {
-    // --import-keys <file>   (lines: "assemblyAI: <key>" / "claude: <key>")
-    guard args.count > i + 1,
-          let content = try? String(contentsOfFile: args[i + 1], encoding: .utf8) else {
-        FileHandle.standardError.write(Data("usage: --import-keys <file>\n".utf8))
+    // --import-keys [file]  reads a .env file (KEY=value) and moves the keys
+    // into the Keychain, which is the only place the app reads them from.
+    let path = args.count > i + 1 && !args[i + 1].hasPrefix("--") ? args[i + 1] : ".env"
+    guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+        eprintLine("cannot read \(path) — copy .env.example to .env and add your keys")
         exit(2)
     }
     let keychain = KeychainStore()
     var imported = 0
-    for line in content.split(separator: "\n") {
-        let parts = line.split(separator: ":", maxSplits: 1).map {
+    for rawLine in content.split(separator: "\n") {
+        var line = rawLine.trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+        if line.hasPrefix("export ") { line = String(line.dropFirst(7)) }
+        let parts = line.split(separator: "=", maxSplits: 1).map {
             $0.trimmingCharacters(in: .whitespaces)
         }
         guard parts.count == 2 else { continue }
-        switch parts[0].lowercased() {
-        case "assemblyai": try! keychain.set(parts[1], for: .assemblyAI); imported += 1
-        case "claude", "anthropic": try! keychain.set(parts[1], for: .anthropic); imported += 1
+        // Tolerate quoted values.
+        var value = parts[1]
+        for quote in ["\"", "'"] where value.hasPrefix(quote) && value.hasSuffix(quote) {
+            value = String(value.dropFirst().dropLast())
+        }
+        guard !value.isEmpty else { continue }
+        switch parts[0].uppercased() {
+        case "MSNOTES_ASSEMBLYAI_KEY": try? keychain.set(value, for: .assemblyAI); imported += 1
+        case "MSNOTES_ANTHROPIC_KEY": try? keychain.set(value, for: .anthropic); imported += 1
         default: continue
         }
     }
-    print("imported \(imported) keys into the Keychain")
-    exit(imported > 0 ? 0 : 1)
+    guard imported > 0 else {
+        eprintLine("no keys found in \(path) — expected MSNOTES_ASSEMBLYAI_KEY and MSNOTES_ANTHROPIC_KEY")
+        exit(1)
+    }
+    print("imported \(imported) key(s) into the Keychain")
+    exit(0)
 }
 
 if args.contains("--check-keys") {

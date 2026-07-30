@@ -1,4 +1,5 @@
 # Secrets — never commit
+.env
 api-keys.conf
 
 # Personal audio — never commit
@@ -6,9 +7,15 @@ test-audio/
 
 # Build artifacts
 .build/
-*.o
-spikes/spike-tap
 dist/
+Resources/AppIcon.icns
+*.o
+
+# Internal working documents, kept locally
+IDEA.md
+SPEC.md
+CONTEXT.md
+MORNING.md
 
 # macOS
 .DS_Store
