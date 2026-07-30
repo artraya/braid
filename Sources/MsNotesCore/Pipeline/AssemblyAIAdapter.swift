@@ -39,7 +39,7 @@ public struct AssemblyAIAdapter: STTProvider {
         var request = URLRequest(url: baseURL.appendingPathComponent("v2/upload"))
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "authorization")
-        log.info("assemblyai upload \(file.lastPathComponent, privacy: .public)")
+        log.notice("assemblyai upload \(file.lastPathComponent, privacy: .public)")
         let (data, response) = try await send(request, uploadFile: file)
         let json = try Self.json(data, response, context: "upload")
         guard let url = json["upload_url"] as? String else {
@@ -48,8 +48,11 @@ public struct AssemblyAIAdapter: STTProvider {
         return url
     }
 
-    func submit(audioURL: String, diarize: Bool, speakerRange: ClosedRange<Int>?,
-                keyTerms: [String]) async throws -> String {
+    /// The exact submission body. Split out so R6 can be verified against the
+    /// real code rather than a reimplementation of it.
+    public static func requestBody(audioURL: String, diarize: Bool,
+                                   speakerRange: ClosedRange<Int>?,
+                                   keyTerms: [String]) -> [String: Any] {
         var body: [String: Any] = [
             "audio_url": audioURL,
             "speech_models": ["universal-3-5-pro"],
@@ -65,6 +68,19 @@ public struct AssemblyAIAdapter: STTProvider {
         if !keyTerms.isEmpty {
             body["keyterms_prompt"] = keyTerms
         }
+        return body
+    }
+
+    /// Speaker hints per R6: the Remote Track gets a range of 1…(participants+1),
+    /// or 1…6 when no Participants were given.
+    public static func remoteSpeakerRange(participantCount: Int) -> ClosedRange<Int> {
+        1...(participantCount == 0 ? 6 : participantCount + 1)
+    }
+
+    func submit(audioURL: String, diarize: Bool, speakerRange: ClosedRange<Int>?,
+                keyTerms: [String]) async throws -> String {
+        let body = Self.requestBody(audioURL: audioURL, diarize: diarize,
+                                    speakerRange: speakerRange, keyTerms: keyTerms)
         var request = URLRequest(url: baseURL.appendingPathComponent("v2/transcript"))
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "authorization")
@@ -72,7 +88,7 @@ public struct AssemblyAIAdapter: STTProvider {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         // R6 check inspects these parameters; the API key is never logged.
         let logged = body.merging(["audio_url": "<uploaded>"]) { _, new in new }
-        log.info("assemblyai submit: \(String(describing: logged), privacy: .public)")
+        log.notice("assemblyai submit: \(String(describing: logged), privacy: .public)")
         let (data, response) = try await send(request)
         let json = try Self.json(data, response, context: "submit")
         if let error = json["error"] as? String {

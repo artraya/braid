@@ -5,6 +5,18 @@ func eprintLine(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
 }
 
+/// Test-mode key source. The app itself only ever stores keys in the Keychain
+/// (R13); these env vars exist so the verification harness can run against
+/// freshly-built binaries, whose changed code signature invalidates the
+/// Keychain ACL and would otherwise block on a GUI consent prompt.
+func testKeys() -> (stt: String, claude: String)? {
+    let env = ProcessInfo.processInfo.environment
+    let keychain = KeychainStore()
+    guard let stt = env["MSNOTES_ASSEMBLYAI_KEY"] ?? keychain.get(.assemblyAI),
+          let claude = env["MSNOTES_ANTHROPIC_KEY"] ?? keychain.get(.anthropic) else { return nil }
+    return (stt, claude)
+}
+
 // Headless verification modes (used by R-checks; see SPEC.md Requirements).
 // Returns true when a CLI mode ran (the SwiftUI shell must not launch).
 func runCLI() -> Bool {
@@ -90,9 +102,8 @@ if let i = args.firstIndex(of: "--process-test") {
         args.count > t + 1 ? args[t + 1] : nil
     } ?? "Process Test"
 
-    let keychain = KeychainStore()
-    guard let sttKey = keychain.get(.assemblyAI), let claudeKey = keychain.get(.anthropic) else {
-        FileHandle.standardError.write(Data("keys missing — run --import-keys first\n".utf8))
+    guard let (sttKey, claudeKey) = testKeys() else {
+        eprintLine("keys missing — run --import-keys or set MSNOTES_*_KEY")
         exit(1)
     }
 
@@ -100,6 +111,9 @@ if let i = args.firstIndex(of: "--process-test") {
     settings.vaultPath = vault
     let jobsRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("msnotes-jobs-\(UUID().uuidString)")
+
+    let remoteSilent = args.contains("--remote-silent")
+    let costBefore = settings.costTotalUSD
 
     let session = Session(title: title, presetName: "Meeting",
                           participants: ["Alex", "Tayet"], startedAt: Date(),
@@ -123,6 +137,7 @@ if let i = args.firstIndex(of: "--process-test") {
                 print("job started: \(job.id)")
             case .jobDone(_, let noteURL):
                 print("job done -> \(noteURL.path)")
+                print(String(format: "cost delta: %.4f", settings.costTotalUSD - costBefore))
                 print("PROCESS-TEST-OK")
                 exitCode = 0
                 semaphore.signal()
@@ -134,16 +149,140 @@ if let i = args.firstIndex(of: "--process-test") {
             }
         })
     let queue = JobQueue(env: env)
-    eprintLine("enqueueing job \(session.id) (jobs root: \(jobsRoot.path))")
-    // Detached: top-level code is MainActor-isolated and the semaphore below
-    // blocks the main thread — an inherited-context Task would never start.
+    // Detached: the semaphore below blocks this thread — an inherited-context
+    // Task would never start.
     Task.detached {
-        eprintLine("detached task running")
-        await queue.enqueue(session: session, remoteSilent: false)
-        eprintLine("enqueue returned")
+        await queue.enqueue(session: session, remoteSilent: remoteSilent)
     }
     _ = semaphore.wait(timeout: .now() + 900)
     exit(exitCode)
+}
+
+if args.firstIndex(of: "--retry-test") != nil {
+    // R7 choreography: unwritable Vault -> permanent failure, Recording kept,
+    // no auto-retry; restore -> user Retry -> success, Recording deleted.
+    setbuf(stdout, nil)
+    guard let (sttKey, claudeKey) = testKeys() else {
+        eprintLine("keys missing — run --import-keys or set MSNOTES_*_KEY"); exit(1)
+    }
+    let fm = FileManager.default
+    let vault = fm.temporaryDirectory.appendingPathComponent("r7-vault-\(UUID().uuidString)")
+    try! fm.createDirectory(at: vault, withIntermediateDirectories: true)
+    let settings = SettingsStore()
+    settings.vaultPath = vault.path
+    let jobsRoot = fm.temporaryDirectory
+        .appendingPathComponent("msnotes-jobs-\(UUID().uuidString)")
+
+    let session = Session(title: "R7 Retry Test", presetName: "Meeting",
+                          participants: [], startedAt: Date(), recordedDuration: 246)
+    let jobDir = jobsRoot.appendingPathComponent(session.id)
+    try! fm.createDirectory(at: jobDir, withIntermediateDirectories: true)
+    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-mic.caf"),
+                     to: jobDir.appendingPathComponent("mic.caf"))
+    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-remote.caf"),
+                     to: jobDir.appendingPathComponent("remote.caf"))
+
+    // Make the Vault unwritable.
+    try! fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: vault.path)
+
+    let failedOnce = DispatchSemaphore(value: 0)
+    let doneSem = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var queueRef: JobQueue?
+    let env = JobQueue.Environment(
+        provider: AssemblyAIAdapter(apiKey: sttKey),
+        summariser: Summariser(apiKey: claudeKey),
+        settings: settings,
+        jobsRoot: jobsRoot,
+        onEvent: { event in
+            switch event {
+            case .jobStarted(let job):
+                print("job started (attempt \(job.attempts))")
+            case .jobFailed(_, let transient):
+                print("failed as expected (transient=\(transient))")
+                if !transient { failedOnce.signal() }
+            case .jobDone(_, let noteURL):
+                print("retry succeeded -> \(noteURL.lastPathComponent)")
+                doneSem.signal()
+            default: break
+            }
+        })
+    let queue = JobQueue(env: env)
+    queueRef = queue
+    print("enqueueing R7 job (vault locked at \(vault.path))")
+    Task.detached { await queue.enqueue(session: session, remoteSilent: false) }
+
+    guard failedOnce.wait(timeout: .now() + 600) == .success else {
+        eprintLine("R7-FAIL: no permanent failure observed"); exit(1)
+    }
+    // Recording must survive the failure.
+    guard fm.fileExists(atPath: jobDir.appendingPathComponent("mic.caf").path) else {
+        eprintLine("R7-FAIL: recording deleted after failure"); exit(1)
+    }
+    print("recording retained after failure ✓")
+    // No auto-retry for permanent failures: wait 10s, still failed.
+    Thread.sleep(forTimeInterval: 10)
+    guard fm.fileExists(atPath: jobDir.appendingPathComponent("mic.caf").path) else {
+        eprintLine("R7-FAIL: auto-retry happened for permanent failure"); exit(1)
+    }
+    print("no automatic retry for permanent failure ✓")
+    // Restore and user-Retry.
+    try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: vault.path)
+    Task.detached { await queueRef?.retry(id: session.id) }
+    guard doneSem.wait(timeout: .now() + 600) == .success else {
+        eprintLine("R7-FAIL: retry did not complete"); exit(1)
+    }
+    guard !fm.fileExists(atPath: jobDir.path) else {
+        eprintLine("R7-FAIL: recording not deleted after success"); exit(1)
+    }
+    print("recording deleted only after confirmed success ✓")
+    print("R7-TEST-OK")
+    exit(0)
+}
+
+if args.firstIndex(of: "--offline-test") != nil {
+    // R8: unreachable Provider -> transient failure -> job stays queued with
+    // Recording intact (the backoff loop owns the eventual completion).
+    setbuf(stdout, nil)
+    let fm = FileManager.default
+    let vault = fm.temporaryDirectory.appendingPathComponent("r8-vault-\(UUID().uuidString)")
+    try! fm.createDirectory(at: vault, withIntermediateDirectories: true)
+    let settings = SettingsStore()
+    settings.vaultPath = vault.path
+    let jobsRoot = fm.temporaryDirectory
+        .appendingPathComponent("msnotes-jobs-\(UUID().uuidString)")
+    let session = Session(title: "R8 Offline Test", presetName: "Meeting",
+                          participants: [], startedAt: Date(), recordedDuration: 246)
+    let jobDir = jobsRoot.appendingPathComponent(session.id)
+    try! fm.createDirectory(at: jobDir, withIntermediateDirectories: true)
+    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-mic.caf"),
+                     to: jobDir.appendingPathComponent("mic.caf"))
+    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-remote.caf"),
+                     to: jobDir.appendingPathComponent("remote.caf"))
+
+    let sem = DispatchSemaphore(value: 0)
+    let env = JobQueue.Environment(
+        provider: AssemblyAIAdapter(apiKey: "irrelevant",
+                                    baseURL: URL(string: "https://127.0.0.1:9")!),
+        summariser: Summariser(apiKey: "irrelevant"),
+        settings: settings,
+        jobsRoot: jobsRoot,
+        onEvent: { event in
+            if case .jobFailed(let job, let transient) = event {
+                print("offline failure observed: transient=\(transient), status=\(job.status.rawValue)")
+                if transient { sem.signal() }
+            }
+        })
+    let queue = JobQueue(env: env)
+    Task.detached { await queue.enqueue(session: session, remoteSilent: false) }
+    guard sem.wait(timeout: .now() + 120) == .success else {
+        eprintLine("R8-FAIL: no transient failure observed"); exit(1)
+    }
+    guard fm.fileExists(atPath: jobDir.appendingPathComponent("mic.caf").path) else {
+        eprintLine("R8-FAIL: recording lost on offline failure"); exit(1)
+    }
+    print("job re-queued with recording intact; backoff loop owns completion ✓")
+    print("R8-TEST-OK")
+    exit(0)
 }
 
 if args.contains("--version") {

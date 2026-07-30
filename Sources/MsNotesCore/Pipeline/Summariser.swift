@@ -43,7 +43,7 @@ public struct Summariser: Sendable {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        log.info("summarise: model=\(model, privacy: .public) preset=\(preset.name, privacy: .public) chars=\(userContent.count)")
+        log.notice("summarise: model=\(model, privacy: .public) preset=\(preset.name, privacy: .public) chars=\(userContent.count)")
 
         let data: Data
         let response: URLResponse

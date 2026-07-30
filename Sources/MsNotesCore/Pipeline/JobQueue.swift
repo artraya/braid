@@ -84,16 +84,18 @@ public actor JobQueue {
     /// queued ones. Jobs found `running` were interrupted — re-queue them.
     public func loadPersisted() {
         let fm = FileManager.default
-        guard let dirs = try? fm.contentsOfDirectory(at: env.jobsRoot,
+        guard let files = try? fm.contentsOfDirectory(at: env.jobsRoot,
                 includingPropertiesForKeys: nil) else { return }
-        for dir in dirs {
-            let stateURL = dir.appendingPathComponent("job.json")
-            guard let data = try? Data(contentsOf: stateURL),
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
                   var job = try? JSONDecoder().decode(Job.self, from: data) else { continue }
+            // Finished Jobs have nothing to resume; drop their state file.
+            if job.status == .done { try? fm.removeItem(at: file); continue }
+            // A Job found `running` was interrupted mid-flight — re-queue it.
             if job.status == .running { job.status = .queued }
             jobs[job.id] = job
         }
-        log.info("loaded \(self.jobs.count) persisted jobs")
+        log.notice("loaded \(self.jobs.count) persisted jobs")
         kickRunner()
     }
 
@@ -153,7 +155,7 @@ public actor JobQueue {
         jobs[jobID] = job
         persist(job)
         env.onEvent(.jobStarted(job))
-        log.info("job \(jobID, privacy: .public) started (attempt \(job.attempts))")
+        log.notice("job \(jobID, privacy: .public) started (attempt \(job.attempts))")
 
         do {
             let noteURL = try await execute(job)
@@ -163,7 +165,7 @@ public actor JobQueue {
             jobs[jobID] = job
             persist(job)
             env.onEvent(.jobDone(job, noteURL: noteURL))
-            log.info("job \(jobID, privacy: .public) done -> \(noteURL.lastPathComponent, privacy: .public)")
+            log.notice("job \(jobID, privacy: .public) done -> \(noteURL.lastPathComponent, privacy: .public)")
         } catch {
             let pipelineError = error as? PipelineError ?? .permanent("\(error)")
             job.lastError = pipelineError.description
@@ -202,14 +204,14 @@ public actor JobQueue {
         // Speaker hints (R6): Mic Track has exactly one speaker — submitted
         // without diarization and labelled "Me". Remote Track range: 1 to
         // participants+1, or 6 with no Participants given.
-        let maxSpeakers = job.session.participants.isEmpty
-            ? 6 : job.session.participants.count + 1
+        let speakerRange = AssemblyAIAdapter.remoteSpeakerRange(
+            participantCount: job.session.participants.count)
         let keyTerms = env.settings.keyTerms
 
         async let micTask = env.provider.transcribe(
             track: micFLAC, diarize: false, speakerRange: nil, keyTerms: keyTerms)
         async let remoteTask = env.provider.transcribe(
-            track: remoteFLAC, diarize: true, speakerRange: 1...maxSpeakers, keyTerms: keyTerms)
+            track: remoteFLAC, diarize: true, speakerRange: speakerRange, keyTerms: keyTerms)
         let (micUtterances, remoteUtterances) = try await (micTask, remoteTask)
 
         let transcript = mergeTranscripts(
@@ -259,11 +261,14 @@ public actor JobQueue {
 
     // MARK: - Persistence
 
+    /// Job state lives *beside* the Recording directory, never inside it —
+    /// writing state into `<jobsRoot>/<id>/` would recreate the directory the
+    /// pipeline just deleted on success (R7).
     func persist(_ job: Job) {
-        let dir = env.jobsRoot.appendingPathComponent(job.id)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: env.jobsRoot, withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(job) {
-            try? data.write(to: dir.appendingPathComponent("job.json"), options: .atomic)
+            try? data.write(to: env.jobsRoot.appendingPathComponent("\(job.id).json"),
+                            options: .atomic)
         }
     }
 }
