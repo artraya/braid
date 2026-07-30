@@ -6,9 +6,9 @@ or something that genuinely needs you.
 
 ---
 
-## Do these two things first (5 minutes)
+## Do this one thing first (2 minutes)
 
-**1. Grant the two audio permissions.** They can only be granted by a real
+**Grant the two audio permissions.** They can only be granted by a real
 person clicking a dialog. The app is running now; open the menu-bar icon
 (a waveform circle, right side of the menu bar) → **Start Recording…** → give
 it a title → Start. macOS will ask twice:
@@ -20,11 +20,13 @@ it a title → Start. macOS will ask twice:
 Talk for ten seconds, hit Stop, and a note should land in your vault within a
 couple of minutes.
 
-**2. Re-enter your API keys in Settings.** Menu → Settings… → paste both keys →
-Save. They are already in your Keychain, but they were written by the *build*
-binary; the installed app is a different code identity, so macOS will otherwise
-prompt for consent on first read. Re-saving from the installed app fixes it
-permanently. (`api-keys.conf` is gitignored and never committed.)
+**Keys and vault path are already done** — no Settings trip needed. The
+Keychain password prompts you saw were caused by the keys being written by a
+*build* binary while the installed app was a different code identity; every
+rebuild invalidated the permission and queued another dialog. Fixed properly:
+the old items were deleted and the installed app wrote its own, so it now owns
+them. Verified by reading them back with no prompt. (You'll see one prompt
+again only if you reinstall a new build — click **Always Allow** that once.)
 
 **Optional:** add your jargon to **Key Terms** (one per line) — "Pangaea",
 "QuickSlope", "Geomoss", site names, colleague names. This is the single

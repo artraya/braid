@@ -88,6 +88,18 @@ if let i = args.firstIndex(of: "--import-keys") {
     exit(imported > 0 ? 0 : 1)
 }
 
+if args.contains("--check-keys") {
+    // Reads both keys from the Keychain and reports, without printing them.
+    // If this returns instantly, this binary owns the Keychain items and will
+    // never raise a consent prompt.
+    let keychain = KeychainStore()
+    let stt = keychain.get(.assemblyAI)
+    let claude = keychain.get(.anthropic)
+    print("assemblyAI: \(stt.map { "present (\($0.count) chars)" } ?? "MISSING")")
+    print("anthropic: \(claude.map { "present (\($0.count) chars)" } ?? "MISSING")")
+    exit(stt != nil && claude != nil ? 0 : 1)
+}
+
 if let i = args.firstIndex(of: "--process-test") {
     setbuf(stdout, nil)
     // --process-test <mic.caf> <remote.caf> <vault-dir> [--title T]

@@ -19,6 +19,8 @@ public struct KeychainStore: Sendable {
         SecItemDelete(query as CFDictionary)
         var add = query
         add[kSecValueData as String] = data
+        // Readable whenever the keychain is unlocked, with no extra auth step.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         let status = SecItemAdd(add as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(status),
