@@ -1,9 +1,14 @@
 import Foundation
 import MsNotesCore
 
+func eprintLine(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+}
+
 // Headless verification modes (used by R-checks; see SPEC.md Requirements).
-// The SwiftUI shell takes over when launched with no arguments (Phase 3).
-let args = CommandLine.arguments
+// Returns true when a CLI mode ran (the SwiftUI shell must not launch).
+func runCLI() -> Bool {
+    let args = CommandLine.arguments
 
 if let i = args.firstIndex(of: "--record-test") {
     // --record-test <dir> <seconds> [--pause <at> <for>]
@@ -71,10 +76,6 @@ if let i = args.firstIndex(of: "--import-keys") {
     exit(imported > 0 ? 0 : 1)
 }
 
-func eprint(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
-}
-
 if let i = args.firstIndex(of: "--process-test") {
     setbuf(stdout, nil)
     // --process-test <mic.caf> <remote.caf> <vault-dir> [--title T]
@@ -133,16 +134,22 @@ if let i = args.firstIndex(of: "--process-test") {
             }
         })
     let queue = JobQueue(env: env)
-    eprint("enqueueing job \(session.id) (jobs root: \(jobsRoot.path))")
+    eprintLine("enqueueing job \(session.id) (jobs root: \(jobsRoot.path))")
     // Detached: top-level code is MainActor-isolated and the semaphore below
     // blocks the main thread — an inherited-context Task would never start.
     Task.detached {
-        eprint("detached task running")
+        eprintLine("detached task running")
         await queue.enqueue(session: session, remoteSilent: false)
-        eprint("enqueue returned")
+        eprintLine("enqueue returned")
     }
     _ = semaphore.wait(timeout: .now() + 900)
     exit(exitCode)
 }
 
-print("ms-notes \(MsNotes.version)")
+if args.contains("--version") {
+    print("ms-notes \(MsNotes.version)")
+    return true
+}
+
+return false
+}
