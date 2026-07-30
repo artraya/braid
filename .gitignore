@@ -1,0 +1,14 @@
+# Secrets — never commit
+api-keys.conf
+
+# Personal audio — never commit
+test-audio/
+
+# Build artifacts
+.build/
+*.o
+spikes/spike-tap
+dist/
+
+# macOS
+.DS_Store
