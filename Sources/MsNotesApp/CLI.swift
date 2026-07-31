@@ -172,6 +172,11 @@ if let i = args.firstIndex(of: "--process-test") {
                 if !transient { semaphore.signal() }
             case .remoteSilentWarning:
                 print("WARNING: remote track silent (R16)")
+            case .speakersDetected(_, let stats):
+                let described = stats
+                    .map { "\($0.speaker) (\(Int($0.totalSeconds))s)" }
+                    .joined(separator: ", ")
+                print("speakers detected: \(described)")
             }
         })
     let queue = JobQueue(env: env)

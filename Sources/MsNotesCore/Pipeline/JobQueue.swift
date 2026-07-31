@@ -46,18 +46,21 @@ public actor JobQueue {
         public var settings: SettingsStore
         public var costTable: CostTable
         public var jobsRoot: URL
+        public var transcripts: TranscriptStore
         /// Called on status changes so the UI can react (icon state, notifications).
         public var onEvent: @Sendable (Event) -> Void
 
         public init(provider: STTProvider, summariser: Summariser, settings: SettingsStore,
                     costTable: CostTable = .current,
                     jobsRoot: URL = JobQueue.appSupportURL.appendingPathComponent("jobs"),
+                    transcripts: TranscriptStore = TranscriptStore(),
                     onEvent: @escaping @Sendable (Event) -> Void = { _ in }) {
             self.provider = provider
             self.summariser = summariser
             self.settings = settings
             self.costTable = costTable
             self.jobsRoot = jobsRoot
+            self.transcripts = transcripts
             self.onEvent = onEvent
         }
     }
@@ -67,6 +70,9 @@ public actor JobQueue {
         case jobDone(Job, noteURL: URL)
         case jobFailed(Job, transient: Bool)
         case remoteSilentWarning(Job)
+        /// The Note is already written; these are the Remote speakers the user
+        /// may want to put names to.
+        case speakersDetected(Job, [Transcript.SpeakerStat])
     }
 
     let log = Logger(subsystem: "no.msnotes.app", category: "pipeline")
@@ -201,17 +207,16 @@ public actor JobQueue {
         let micFLAC = try Transcoder.toFLAC(micCAF)
         let remoteFLAC = try Transcoder.toFLAC(remoteCAF)
 
-        // Speaker hints (R6): Mic Track has exactly one speaker — submitted
-        // without diarization and labelled "Me". Remote Track range: 1 to
-        // participants+1, or 6 with no Participants given.
-        let speakerRange = AssemblyAIAdapter.remoteSpeakerRange(
-            participantCount: job.session.participants.count)
+        // R6: the Mic Track has exactly one speaker, so it goes without
+        // diarization and is labelled "Me". The Remote Track is diarized with
+        // no speaker count at all — Participants must not cap it (see
+        // AssemblyAIAdapter.requestBody).
         let keyTerms = env.settings.keyTerms
 
         async let micTask = env.provider.transcribe(
-            track: micFLAC, diarize: false, speakerRange: nil, keyTerms: keyTerms)
+            track: micFLAC, diarize: false, keyTerms: keyTerms)
         async let remoteTask = env.provider.transcribe(
-            track: remoteFLAC, diarize: true, speakerRange: speakerRange, keyTerms: keyTerms)
+            track: remoteFLAC, diarize: true, keyTerms: keyTerms)
         let (micUtterances, remoteUtterances) = try await (micTask, remoteTask)
 
         let transcript = mergeTranscripts(
@@ -253,6 +258,19 @@ public actor JobQueue {
         }
 
         env.settings.addCost(cost)
+
+        // Keep the structured Transcript so speakers can be named later. The
+        // Vault only holds markdown, and the Recording is about to go.
+        let stats = transcript.remoteSpeakerStats()
+        if !stats.isEmpty {
+            let noteContents = (try? String(contentsOf: written.noteURL, encoding: .utf8)) ?? ""
+            env.transcripts.save(NamingRecord(
+                session: job.session, transcript: transcript, provider: env.provider.name,
+                costUSD: cost, notePath: written.noteURL.path,
+                transcriptPath: written.transcriptURL.path,
+                noteHash: NamingRecord.hash(noteContents)))
+            env.onEvent(.speakersDetected(job, stats))
+        }
 
         // Only a confirmed-success Job may delete a Recording (Operation).
         try? fm.removeItem(at: dir)

@@ -48,6 +48,67 @@ public struct Transcript: Sendable, Codable, Equatable {
         return seen
     }
 
+    /// What the naming sheet needs to tell one speaker from another: how much
+    /// they talked and a line long enough to recognise them by.
+    public struct SpeakerStat: Sendable, Codable, Equatable, Identifiable {
+        public var id: String { speaker }
+        public var speaker: String
+        public var totalSeconds: TimeInterval
+        public var utteranceCount: Int
+        /// Their longest utterance, truncated. Long lines identify a person far
+        /// better than first lines, which are usually "yeah" or "can you hear me".
+        public var sample: String
+        public var firstAt: TimeInterval
+    }
+
+    /// Remote speakers with talk time, most talkative first.
+    public func remoteSpeakerStats(sampleLimit: Int = 160) -> [SpeakerStat] {
+        var stats: [String: SpeakerStat] = [:]
+        for u in utterances where u.speaker != "Me" {
+            let spoken = max(0, u.end - u.start)
+            if var existing = stats[u.speaker] {
+                existing.totalSeconds += spoken
+                existing.utteranceCount += 1
+                if u.text.count > existing.sample.count { existing.sample = u.text }
+                existing.firstAt = min(existing.firstAt, u.start)
+                stats[u.speaker] = existing
+            } else {
+                stats[u.speaker] = SpeakerStat(
+                    speaker: u.speaker, totalSeconds: spoken, utteranceCount: 1,
+                    sample: u.text, firstAt: u.start)
+            }
+        }
+        return stats.values
+            .map { stat in
+                var copy = stat
+                if copy.sample.count > sampleLimit {
+                    copy.sample = String(copy.sample.prefix(sampleLimit)) + "…"
+                }
+                return copy
+            }
+            .sorted {
+                $0.totalSeconds == $1.totalSeconds
+                    ? $0.firstAt < $1.firstAt
+                    : $0.totalSeconds > $1.totalSeconds
+            }
+    }
+
+    /// Applies user-assigned names. Keys are current labels ("Speaker 1"),
+    /// values the names to use. Unmapped and blank entries are left alone, and
+    /// "Me" is never renamed (R11).
+    public func renamingSpeakers(_ names: [String: String]) -> Transcript {
+        var copy = self
+        copy.utterances = utterances.map { u in
+            guard u.speaker != "Me",
+                  let name = names[u.speaker]?.trimmingCharacters(in: .whitespaces),
+                  !name.isEmpty else { return u }
+            var renamed = u
+            renamed.speaker = name
+            return renamed
+        }
+        return copy
+    }
+
     /// Markdown per SPEC (Transcript format): one line per utterance,
     /// `- **HH:MM:SS Speaker:** text`, pause markers on their own line.
     public func markdown() -> String {

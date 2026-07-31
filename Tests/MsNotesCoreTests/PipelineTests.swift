@@ -180,31 +180,141 @@ import Testing
 
 // MARK: - Provider request parameters (R6)
 
-@Test func remoteTrackRequestCarriesLanguageKeytermsAndSpeakerRange() {
+@Test func remoteTrackRequestCarriesLanguageAndKeyterms() {
     let body = AssemblyAIAdapter.requestBody(
         audioURL: "https://example/x", diarize: true,
-        speakerRange: AssemblyAIAdapter.remoteSpeakerRange(participantCount: 2),
         keyTerms: ["Acme Geo", "SlopeWatch"])
     #expect(body["language_code"] as? String == "en_au")
     #expect(body["speech_models"] as? [String] == ["universal-3-5-pro"])
     #expect(body["speaker_labels"] as? Bool == true)
     #expect(body["keyterms_prompt"] as? [String] == ["Acme Geo", "SlopeWatch"])
-    let options = body["speaker_options"] as? [String: Int]
-    #expect(options?["min_speakers_expected"] == 1)
-    #expect(options?["max_speakers_expected"] == 3)  // participants + 1
 }
 
-@Test func micTrackRequestIsUndiarizedWithNoSpeakerOptions() {
+@Test func micTrackRequestIsUndiarized() {
     let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: false, speakerRange: nil, keyTerms: [])
+        audioURL: "https://example/x", diarize: false, keyTerms: [])
     #expect(body["language_code"] as? String == "en_au")
     #expect(body["speaker_labels"] as? Bool == false)
-    #expect(body["speaker_options"] == nil)
     #expect(body["keyterms_prompt"] == nil)
 }
 
-@Test func speakerRangeDefaultsToSixWithoutParticipants() {
-    #expect(AssemblyAIAdapter.remoteSpeakerRange(participantCount: 0) == 1...6)
-    #expect(AssemblyAIAdapter.remoteSpeakerRange(participantCount: 1) == 1...2)
-    #expect(AssemblyAIAdapter.remoteSpeakerRange(participantCount: 4) == 1...5)
+/// R6: no request may cap the speaker count. Capping it at Participants+1 meant
+/// a late joiner was folded into an existing speaker.
+@Test func noRequestEverConstrainsTheSpeakerCount() {
+    for diarize in [true, false] {
+        let body = AssemblyAIAdapter.requestBody(
+            audioURL: "https://example/x", diarize: diarize, keyTerms: ["Acme Geo"])
+        #expect(body["speaker_options"] == nil)
+        #expect(body["speakers_expected"] == nil)
+    }
+}
+
+// MARK: - Speaker stats and renaming
+
+@Test func speakerStatsRankByTalkTimeAndSampleTheLongestLine() {
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Me", start: 0, end: 30, text: "my long opening"),
+        Utterance(speaker: "Speaker 1", start: 30, end: 32, text: "yeah"),
+        Utterance(speaker: "Speaker 2", start: 32, end: 52, text: "a considered point"),
+        Utterance(speaker: "Speaker 1", start: 52, end: 55, text: "quick follow up"),
+    ])
+    let stats = t.remoteSpeakerStats()
+    // "Me" is never offered for naming.
+    #expect(stats.map(\.speaker) == ["Speaker 2", "Speaker 1"])
+    #expect(abs(stats[0].totalSeconds - 20) < 0.001)
+    #expect(stats[1].utteranceCount == 2)
+    // Longest utterance, not the first, identifies a voice best.
+    #expect(stats[1].sample == "quick follow up")
+    #expect(abs(stats[1].firstAt - 30) < 0.001)
+}
+
+@Test func speakerStatsTruncateLongSamples() {
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Speaker 1", start: 0, end: 5, text: String(repeating: "a", count: 300)),
+    ])
+    let sample = t.remoteSpeakerStats(sampleLimit: 20)[0].sample
+    #expect(sample.count == 21)
+    #expect(sample.hasSuffix("…"))
+}
+
+@Test func renamingAppliesNamesButNeverTouchesMe() {
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Me", start: 0, end: 1, text: "a"),
+        Utterance(speaker: "Speaker 1", start: 1, end: 2, text: "b"),
+        Utterance(speaker: "Speaker 2", start: 2, end: 3, text: "c"),
+        Utterance(speaker: "Speaker 3", start: 3, end: 4, text: "d"),
+    ])
+    let renamed = t.renamingSpeakers([
+        "Speaker 1": "Sarah",
+        "Speaker 2": "   ",     // blank: left alone
+        "Me": "Someone Else",   // R11: ignored
+    ])
+    #expect(renamed.utterances.map(\.speaker) == ["Me", "Sarah", "Speaker 2", "Speaker 3"])
+}
+
+// MARK: - Naming records
+
+@Test func transcriptStoreRoundTripsAndPurges() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("transcripts-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = TranscriptStore(root: dir)
+
+    let session = Session(title: "Sync", presetName: "Meeting", participants: [],
+                          startedAt: Date(), recordedDuration: 60)
+    let t = Transcript(utterances: [Utterance(speaker: "Speaker 1", start: 0, end: 1, text: "x")])
+    let record = NamingRecord(session: session, transcript: t, provider: "assemblyai",
+                              costUSD: 0.5, notePath: "/tmp/n.md",
+                              transcriptPath: "/tmp/t.md", noteHash: "abc")
+    store.save(record)
+
+    let loaded = try #require(store.load(session.id))
+    #expect(loaded.transcript == t)
+    #expect(loaded.namesApplied == false)
+    #expect(store.all().count == 1)
+
+    // Inside the window it survives; past it, it goes.
+    store.purgeExpired(now: record.completedAt.addingTimeInterval(TranscriptStore.retention - 60))
+    #expect(store.all().count == 1)
+    store.purgeExpired(now: record.completedAt.addingTimeInterval(TranscriptStore.retention + 60))
+    #expect(store.all().isEmpty)
+}
+
+@Test func overwriteKeepsBothFilenamesAndRelinksTranscript() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vault-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+    let writer = VaultWriter(vaultURL: dir)
+    var session = Session(title: "Sync", presetName: "Meeting", participants: [],
+                          startedAt: Date(timeIntervalSince1970: 1_790_000_000),
+                          recordedDuration: 60)
+    let before = Transcript(utterances: [
+        Utterance(speaker: "Speaker 1", start: 0, end: 1, text: "hello"),
+    ])
+    let first = try writer.write(session: session, noteBody: "# Before", transcript: before,
+                                 provider: "assemblyai", costUSD: 0.1)
+
+    session.participants = ["Sarah"]
+    let after = before.renamingSpeakers(["Speaker 1": "Sarah"])
+    let second = try writer.overwrite(
+        noteURL: first.noteURL, transcriptURL: first.transcriptURL, session: session,
+        noteBody: "# After", transcript: after, provider: "assemblyai", costUSD: 0.2)
+
+    #expect(second.noteURL == first.noteURL)
+    // No stray duplicate left behind.
+    let notes = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        .filter { $0.pathExtension == "md" }
+    #expect(notes.count == 1)
+
+    let note = try String(contentsOf: second.noteURL, encoding: .utf8)
+    #expect(note.contains("# After"))
+    #expect(note.contains("participants: [Sarah]"))
+    #expect(note.contains("cost: 0.2000"))
+    // The wikilink still points at the transcript that was actually rewritten.
+    let transcriptName = first.transcriptURL.deletingPathExtension().lastPathComponent
+    #expect(note.contains("transcript: \"[[\(transcriptName)]]\""))
+    let body = try String(contentsOf: second.transcriptURL, encoding: .utf8)
+    #expect(body.contains("Sarah:** hello"))
 }

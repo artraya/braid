@@ -6,8 +6,8 @@ public protocol STTProvider: Sendable {
     var name: String { get }
     /// Transcribes one Track. `diarize: false` returns a single unlabelled
     /// speaker stream (the Adapter's caller labels the Mic Track "Me").
-    func transcribe(track: URL, diarize: Bool, speakerRange: ClosedRange<Int>?,
-                    keyTerms: [String]) async throws -> [Utterance]
+    /// Diarization never takes a speaker count: see `requestBody`.
+    func transcribe(track: URL, diarize: Bool, keyTerms: [String]) async throws -> [Utterance]
 }
 
 /// AssemblyAI universal-3-5-pro (SPEC Architecture). Quirks owned here:
@@ -25,11 +25,10 @@ public struct AssemblyAIAdapter: STTProvider {
         self.baseURL = baseURL
     }
 
-    public func transcribe(track: URL, diarize: Bool, speakerRange: ClosedRange<Int>?,
+    public func transcribe(track: URL, diarize: Bool,
                            keyTerms: [String]) async throws -> [Utterance] {
         let uploadURL = try await upload(track)
-        let id = try await submit(audioURL: uploadURL, diarize: diarize,
-                                  speakerRange: speakerRange, keyTerms: keyTerms)
+        let id = try await submit(audioURL: uploadURL, diarize: diarize, keyTerms: keyTerms)
         return try await poll(id: id)
     }
 
@@ -50,8 +49,13 @@ public struct AssemblyAIAdapter: STTProvider {
 
     /// The exact submission body. Split out so R6 can be verified against the
     /// real code rather than a reimplementation of it.
+    ///
+    /// `speaker_options` is deliberately never sent. An earlier version capped
+    /// the Remote Track at Participants+1 speakers, which meant anyone who
+    /// joined a call late was folded into an existing speaker and their words
+    /// attributed to the wrong person. Participants are Summariser hints and
+    /// naming suggestions only; the Provider decides how many voices it hears.
     public static func requestBody(audioURL: String, diarize: Bool,
-                                   speakerRange: ClosedRange<Int>?,
                                    keyTerms: [String]) -> [String: Any] {
         var body: [String: Any] = [
             "audio_url": audioURL,
@@ -59,28 +63,14 @@ public struct AssemblyAIAdapter: STTProvider {
             "language_code": "en_au",
             "speaker_labels": diarize,
         ]
-        if diarize, let range = speakerRange {
-            body["speaker_options"] = [
-                "min_speakers_expected": range.lowerBound,
-                "max_speakers_expected": range.upperBound,
-            ]
-        }
         if !keyTerms.isEmpty {
             body["keyterms_prompt"] = keyTerms
         }
         return body
     }
 
-    /// Speaker hints per R6: the Remote Track gets a range of 1…(participants+1),
-    /// or 1…6 when no Participants were given.
-    public static func remoteSpeakerRange(participantCount: Int) -> ClosedRange<Int> {
-        1...(participantCount == 0 ? 6 : participantCount + 1)
-    }
-
-    func submit(audioURL: String, diarize: Bool, speakerRange: ClosedRange<Int>?,
-                keyTerms: [String]) async throws -> String {
-        let body = Self.requestBody(audioURL: audioURL, diarize: diarize,
-                                    speakerRange: speakerRange, keyTerms: keyTerms)
+    func submit(audioURL: String, diarize: Bool, keyTerms: [String]) async throws -> String {
+        let body = Self.requestBody(audioURL: audioURL, diarize: diarize, keyTerms: keyTerms)
         var request = URLRequest(url: baseURL.appendingPathComponent("v2/transcript"))
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "authorization")

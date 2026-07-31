@@ -10,6 +10,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     let menu = NSMenu()
     lazy var startPanel = StartPanelController(state: state)
     lazy var settingsWindow = SettingsWindowController(state: state)
+    lazy var namingWindow = SpeakerNamingWindowController(state: state)
 
     init(state: AppState) {
         self.state = state
@@ -76,6 +77,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(item)
         }
 
+        if !state.awaitingNames.isEmpty {
+            menu.addItem(.separator())
+            for record in state.awaitingNames {
+                let count = record.transcript.remoteSpeakerStats().count
+                let item = NSMenuItem(
+                    title: "Name \(count) speaker\(count == 1 ? "" : "s") — \(record.session.title)",
+                    action: #selector(nameSpeakersTapped(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = record.id
+                menu.addItem(item)
+            }
+        }
+
         if !state.failedJobs.isEmpty {
             menu.addItem(.separator())
             for job in state.failedJobs {
@@ -118,6 +132,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc func stopTapped() { state.stop() }
     @objc func settingsTapped() { settingsWindow.show() }
     @objc func quitTapped() { NSApp.terminate(nil) }
+
+    @objc func nameSpeakersTapped(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let record = state.awaitingNames.first(where: { $0.id == id }) else { return }
+        namingWindow.show(record: record)
+    }
 
     @objc func retryTapped(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String {

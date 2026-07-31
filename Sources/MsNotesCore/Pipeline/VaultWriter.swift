@@ -62,6 +62,21 @@ public struct VaultWriter: Sendable {
         return Written(noteURL: noteURL(candidate), transcriptURL: transcriptURL(candidate))
     }
 
+    /// Rewrites an existing Note/Transcript pair in place, keeping both
+    /// filenames. Used when speakers are named after the fact: the title has
+    /// not changed, so a new pair would just leave a stale duplicate in the
+    /// Vault and break the link the user already has open.
+    public func overwrite(noteURL: URL, transcriptURL: URL, session: Session,
+                          noteBody: String, transcript: Transcript,
+                          provider: String, costUSD: Double) throws -> Written {
+        let transcriptName = transcriptURL.deletingPathExtension().lastPathComponent
+        let front = frontmatter(session: session, provider: provider, costUSD: costUSD,
+                                transcriptName: transcriptName)
+        try atomicWrite(front + "\n" + noteBody + "\n", to: noteURL)
+        try atomicWrite(transcript.markdown() + "\n", to: transcriptURL)
+        return Written(noteURL: noteURL, transcriptURL: transcriptURL)
+    }
+
     func frontmatter(session: Session, provider: String, costUSD: Double,
                      transcriptName: String) -> String {
         let day = DateFormatter()

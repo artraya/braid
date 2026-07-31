@@ -18,11 +18,16 @@ final class AppState {
     var currentTitle = ""
     var recordingStartedAt: Date?
     let settings = SettingsStore()
+    let transcripts = TranscriptStore()
     var onChange: (() -> Void)?
+
+    /// Finished Sessions whose Remote speakers are still "Speaker 1", "Speaker 2".
+    var awaitingNames: [NamingRecord] = [] { didSet { onChange?() } }
 
     let engine = CaptureEngine()
     private var queue: JobQueue?
     private var currentSession: Session?
+    private var namer: SpeakerNamer?
 
     /// SF Symbol per state (R15: five distinct states).
     var iconName: String {
@@ -48,15 +53,21 @@ final class AppState {
         guard queue == nil else { return }
         guard let sttKey = settings.keychain.get(.assemblyAI),
               let claudeKey = settings.keychain.get(.anthropic) else { return }
+        let summariser = Summariser(apiKey: claudeKey)
         let env = JobQueue.Environment(
             provider: AssemblyAIAdapter(apiKey: sttKey),
-            summariser: Summariser(apiKey: claudeKey),
+            summariser: summariser,
             settings: settings,
+            transcripts: transcripts,
             onEvent: { [weak self] event in
                 Task { @MainActor in self?.handle(event) }
             })
         let queue = JobQueue(env: env)
         self.queue = queue
+        self.namer = SpeakerNamer(summariser: summariser, settings: settings,
+                                  store: transcripts)
+        transcripts.purgeExpired()
+        refreshNamingState()
         Task {
             await queue.loadPersisted()
             await self.refreshJobState()
@@ -83,6 +94,12 @@ final class AppState {
         case .remoteSilentWarning:
             Notifier.notify(title: "No system audio captured",
                             body: "Check the System Audio Recording permission. The note will only contain your side.")
+        case .speakersDetected(let job, let stats):
+            refreshNamingState()
+            let count = stats.count
+            Notifier.notify(
+                title: "\(count) speaker\(count == 1 ? "" : "s") to name",
+                body: "\(job.session.title) — name them from the menu to rewrite the note.")
         }
         Task { await refreshJobState() }
     }
@@ -91,6 +108,37 @@ final class AppState {
         guard let queue else { return }
         processingCount = await queue.pendingCount()
         failedJobs = await queue.failedJobs()
+    }
+
+    func refreshNamingState() {
+        awaitingNames = transcripts.all().filter { !$0.namesApplied }
+    }
+
+    // MARK: - Speaker naming
+
+    /// Relabels a delivered Session and re-runs the Summariser. Costs one
+    /// Claude call; the Recording is long gone, so nothing is re-transcribed.
+    func applyNames(_ names: [String: String], toSessionID id: String,
+                    completion: @escaping (Result<SpeakerNamer.Result, Error>) -> Void) {
+        guard let namer else {
+            completion(.failure(PipelineError.permanent("API keys not configured")))
+            return
+        }
+        Task {
+            do {
+                let result = try await namer.apply(names: names, toSessionID: id)
+                self.refreshNamingState()
+                Notifier.notify(
+                    title: "Note updated",
+                    body: result.wroteNewPair
+                        ? "The original had been edited, so a new note was written."
+                        : result.noteURL.deletingPathExtension().lastPathComponent)
+                completion(.success(result))
+            } catch {
+                self.lastError = "Could not apply names: \(error)"
+                completion(.failure(error))
+            }
+        }
     }
 
     // MARK: - Session control
