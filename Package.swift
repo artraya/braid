@@ -2,21 +2,21 @@
 import PackageDescription
 
 let package = Package(
-    name: "ms-notes",
+    name: "braid",
     platforms: [.macOS("27.0")],
     targets: [
         // All logic lives here, testable headless.
-        .target(name: "MsNotesCore", path: "Sources/MsNotesCore"),
+        .target(name: "BraidCore", path: "Sources/BraidCore"),
         // Thin SwiftUI shell.
         .executableTarget(
-            name: "MsNotesApp",
-            dependencies: ["MsNotesCore"],
-            path: "Sources/MsNotesApp"
+            name: "BraidApp",
+            dependencies: ["BraidCore"],
+            path: "Sources/BraidApp"
         ),
         .testTarget(
-            name: "MsNotesCoreTests",
-            dependencies: ["MsNotesCore"],
-            path: "Tests/MsNotesCoreTests",
+            name: "BraidCoreTests",
+            dependencies: ["BraidCore"],
+            path: "Tests/BraidCoreTests",
             resources: [.copy("Fixtures")]
         ),
     ]

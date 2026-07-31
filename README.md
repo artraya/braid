@@ -1,4 +1,4 @@
-# ms-notes
+# Braid
 
 Record a meeting. Get notes in your Obsidian vault. That is the whole app.
 
@@ -9,12 +9,14 @@ audio is deleted once the note is safely written.
 
 No bot joins your call. No subscription. Nothing to check afterwards.
 
-![the app icon](docs/icon.png)
+<img src="docs/icon.png" alt="the Braid icon" width="128">
+
+Two audio tracks, braided into one transcript and one note.
 
 ## Why this exists
 
 Every tool in this space is a monthly subscription with its own silo to log into.
-This one is about 2000 lines of Swift that you own, calling two APIs you pay for
+This one is about 4400 lines of Swift that you own, calling two APIs you pay for
 directly. Roughly **10 to 14 dollars a month** at two to five hours of calls a
 week, and you can read every line that touches your audio.
 
@@ -46,32 +48,72 @@ You need macOS 27, the Swift command line tools (not Xcode), an
 [Anthropic](https://console.anthropic.com) key.
 
 ```bash
-git clone https://github.com/artraya/ms-notes.git
-cd ms-notes
+git clone https://github.com/artraya/braid.git
+cd braid
 
 cp .env.example .env          # add your two API keys
-./scripts/build-app.sh        # builds dist/ms-notes.app
-cp -R dist/ms-notes.app /Applications/
+./scripts/build-app.sh        # builds dist/Braid.app
+cp -R dist/Braid.app /Applications/
 ./scripts/load-keys.sh        # moves the keys into the Keychain
 ```
 
 Open the app, click the menu bar icon, and set your vault folder in Settings.
 On your first recording macOS asks for Microphone and System Audio Recording.
 
-The build signs the app with a local identity called `ms-notes Development`.
+The build signs the app with a local identity called `ms-notes Development`,
+named before the app was, and kept because renaming a signing identity is what
+makes macOS forget your permissions.
 Create one in Keychain Access, or edit `scripts/build-app.sh` to use your own.
 A stable identity matters, because without it macOS treats every rebuild as a
 brand new app and forgets your permissions.
 
 ## Using it
 
+Left click the menu bar icon for the **panel**, which hangs off the icon and
+points at it. That panel is the whole app. It shows this month's minutes against
+a budget you set, what it has cost, and your recent sessions, each opening its
+note in Obsidian. Record expands it into the start form.
+
+While recording, the same panel gains a block at the top with the clock, a live
+waveform, pause, stop and discard. Click the icon to tuck it away and the
+recording carries on; click again to bring it back.
+
+| idle | recording |
+|---|---|
+| <img src="docs/screenshots/panel.png" width="330"> | <img src="docs/screenshots/panel-recording.png" width="330"> |
+
+Naming speakers, settings and every confirmation happen in there too, so the app
+never opens a second window. Right click the icon for a short menu of shortcuts.
+
+| name speakers | settings | anything irreversible |
+|---|---|---|
+| <img src="docs/screenshots/panel-naming.png" width="240"> | <img src="docs/screenshots/panel-settings.png" width="240"> | <img src="docs/screenshots/panel-confirm.png" width="240"> |
+
 Pick a **preset** when you start recording: Meeting, Lecture, Interview or
 Training. Each one is a prompt template that shapes the note, and all four are
 editable in Settings.
 
-You can type **participant names** at the start. They are only hints. A name is
-used in the note when the transcript actually supports it, otherwise you get
-Speaker 1 and Speaker 2.
+You can type **participant names** at the start. They are hints, never limits.
+The transcriber works out how many people are on the call by itself, so someone
+joining halfway through gets their own speaker rather than being folded into
+whoever spoke last.
+
+Once the note is written, the app offers to **name the speakers** it found, each
+shown with how long they talked and a line they said. Naming rewrites the
+transcript and re-runs the summary, about ten cents. Nothing is guessed for you:
+two names and two voices is a coin flip, and a confidently wrong name is worse
+than Speaker 1. The note lands first either way, so you can ignore the prompt.
+
+Started something by mistake? **Cancel it** from the panel while it is
+processing and it stops before paying for anything it has not already used. The
+audio is kept, so you can send it through after all or delete it deliberately.
+
+<img src="docs/screenshots/panel-processing.png" width="330">
+
+Recording **stops by itself** when your call app lets go of the microphone,
+after a thirty second countdown you can cancel. Starting is always your call.
+It only watches once a call app has actually taken the mic, so dictation is
+never cut short. The app list is editable in Settings.
 
 **Key terms** are the highest value setting in the app. Add proper nouns the
 transcriber would not guess, such as product names, sites and colleagues'
@@ -95,6 +137,11 @@ process taps, which need only the audio-only permission.
 in the cloud. On a RAM-constrained laptop already running a video call, that is
 the difference between usable and not.
 [ADR-0002](docs/adr/0002-cloud-diarization-over-local.md)
+
+**Knowing the call ended without watching the call.** Auto-stop reads Core
+Audio's per-process state and asks one question: is Teams holding the
+microphone? No Accessibility permission, no scraping window titles, nothing that
+breaks when Microsoft redesigns the UI.
 
 **No voiceprints, ever.** Voices are grouped within a single call and then
 forgotten. Nothing that could identify a voice is stored or reused across
@@ -123,15 +170,19 @@ of your own voice. The running total is shown in the app.
 ## Project layout
 
 ```
-Sources/MsNotesCore/   capture engine, provider adapters, job pipeline
-Sources/MsNotesApp/    menu bar app and headless test modes
-Tests/                 unit tests
-scripts/               build, install, icon and key helpers
-docs/adr/              why the difficult decisions went the way they did
+Sources/BraidCore/    capture engine, call watcher, provider adapters, pipeline
+Sources/BraidApp/     menu bar app and headless test modes
+Sources/BraidApp/UI/  the panel: every view the app has
+Tests/                unit tests
+scripts/              build, install, icon and key helpers
+docs/adr/             why the difficult decisions went the way they did
 ```
 
 ```bash
-./scripts/test.sh    # run the tests
+./scripts/test.sh                              # unit tests
+./.build/debug/BraidApp --ui-preview           # every panel view, on screen
+./.build/debug/BraidApp --ui-preview --snapshot docs/screenshots
+./.build/debug/BraidApp --ui-preview --check-geometry
 ```
 
 ## Status
