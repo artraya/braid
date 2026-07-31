@@ -32,6 +32,8 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     private var panel: FloatingPanel?
     private var anchor: MenuBarAnchor?
     private var shownAt: Date?
+    /// When the panel last dismissed itself because it lost focus.
+    private var autoClosedAt: Date?
     /// Set by StatusItemController so Settings and Quit stay reachable from the
     /// panel as well as the right-click menu.
     var onOpenSettings: (() -> Void)?
@@ -43,8 +45,20 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
 
     var isVisible: Bool { panel?.isVisible ?? false }
 
+    /// Clicking the icon while the panel is open must close it.
+    ///
+    /// It cannot simply check `isVisible`: pressing the menu bar item takes key
+    /// status away from the panel first, so the auto-dismiss has already
+    /// closed it by the time this runs, and a naive toggle would reopen it
+    /// immediately — the panel would never close from the icon. A dismiss that
+    /// happened moments ago is treated as "it was open".
     func toggle(from button: NSStatusBarButton?) {
-        if isVisible { close() } else { show(from: button) }
+        let justDismissed = autoClosedAt.map { Date().timeIntervalSince($0) < 0.5 } ?? false
+        if isVisible || justDismissed {
+            close()
+        } else {
+            show(from: button)
+        }
     }
 
     func show(from button: NSStatusBarButton?) {
@@ -55,7 +69,9 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         anchor = MenuBarAnchor(statusItemButton: button) ?? anchor
+        autoClosedAt = nil
         panel.layoutIfNeeded()
+        panel.fitToContent()
         reposition()
         shownAt = Date()
         panel.makeKeyAndOrderFront(nil)
@@ -138,6 +154,7 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     /// closed the panel the instant it opened.
     func windowDidResignKey(_ notification: Notification) {
         guard let shownAt, Date().timeIntervalSince(shownAt) > 0.4 else { return }
+        autoClosedAt = Date()
         close()
     }
 }

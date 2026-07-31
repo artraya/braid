@@ -18,6 +18,9 @@ enum UIPreview {
             snapshot(into: URL(fileURLWithPath: directory))
             exit(0)
         }
+        if CommandLine.arguments.contains("--check-geometry") {
+            exit(checkGeometry() ? 0 : 1)
+        }
 
         let panel = previewWindow(
             title: "Sessions panel",

@@ -28,10 +28,42 @@ final class FloatingPanel: NSPanel {
     /// start form's text fields untypeable.
     override var canBecomeKey: Bool { true }
 
+    private var hosting: ContentHostingView?
+
     func setContent(_ view: some View) {
-        let hosting = NSHostingView(rootView: AnyView(view))
+        let hosting = ContentHostingView(rootView: AnyView(view))
         hosting.sizingOptions = [.preferredContentSize]
+        hosting.onLayout = { [weak self] in self?.fitToContent() }
         contentView = hosting
+        self.hosting = hosting
+        fitToContent()
+    }
+
+    /// Shrinks or grows the window to exactly its content.
+    ///
+    /// Without this the window keeps whatever height it was created with and
+    /// SwiftUI centres the content inside it, which reads as the panel hanging
+    /// well below the menu bar with dead space above it. `.preferredContentSize`
+    /// alone does not resize a borderless panel.
+    func fitToContent() {
+        guard let hosting else { return }
+        let size = hosting.fittingSize
+        // Guard against re-entering: setting the size lays out again.
+        guard size.width > 0, size.height > 0,
+              abs(size.height - frame.height) > 0.5 || abs(size.width - frame.width) > 0.5
+        else { return }
+        setContentSize(size)
+    }
+}
+
+/// Reports back once SwiftUI has laid itself out, which is the only reliable
+/// moment to learn the content's real height.
+private final class ContentHostingView: NSHostingView<AnyView> {
+    var onLayout: (() -> Void)?
+
+    override func layout() {
+        super.layout()
+        onLayout?()
     }
 }
 
