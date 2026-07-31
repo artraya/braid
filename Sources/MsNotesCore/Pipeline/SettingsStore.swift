@@ -34,6 +34,17 @@ public struct SettingsStore: Sendable {
         }
     }
 
+    /// Minutes of recording the user allows themselves per calendar month. The
+    /// usage card warns as this approaches, but recording is never blocked:
+    /// losing a meeting is worse than overshooting a self-imposed budget.
+    public var monthlyMinuteCap: Int {
+        get {
+            let stored = defaults.integer(forKey: "monthlyMinuteCap")
+            return stored > 0 ? stored : 600
+        }
+        nonmutating set { defaults.set(max(0, newValue), forKey: "monthlyMinuteCap") }
+    }
+
     /// Running cost total in USD (SPEC R14).
     public var costTotalUSD: Double {
         get { defaults.double(forKey: "costTotalUSD") }

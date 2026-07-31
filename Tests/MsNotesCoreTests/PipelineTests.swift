@@ -252,6 +252,176 @@ import Testing
     #expect(renamed.utterances.map(\.speaker) == ["Me", "Sarah", "Speaker 2", "Speaker 3"])
 }
 
+// MARK: - Display formatting
+
+@Test func durationAndClockFormatting() {
+    #expect(Format.duration(252) == "4:12")
+    #expect(Format.duration(1720) == "28:40")
+    #expect(Format.duration(3063) == "51:03")
+    #expect(Format.duration(3723) == "1:02:03")
+    #expect(Format.duration(0) == "0:00")
+    // The HUD clock is fixed width so it does not jitter as it counts.
+    #expect(Format.clock(0) == "00:00:00")
+    #expect(Format.clock(736) == "00:12:16")
+    #expect(Format.clock(3723) == "01:02:03")
+    #expect(Format.clock(-5) == "00:00:00")
+}
+
+@Test func relativeDayFormatting() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "Australia/Perth")!
+    func at(_ y: Int, _ m: Int, _ d: Int, _ h: Int, _ min: Int) -> Date {
+        calendar.date(from: DateComponents(year: y, month: m, day: d, hour: h, minute: min))!
+    }
+    let now = at(2026, 7, 31, 14, 0)   // a Friday
+    #expect(Format.when(at(2026, 7, 31, 9, 14), now: now, calendar: calendar) == "Today 09:14")
+    #expect(Format.when(at(2026, 7, 30, 8, 47), now: now, calendar: calendar) == "Yesterday 08:47")
+    #expect(Format.when(at(2026, 7, 29, 10, 0), now: now, calendar: calendar) == "Wed")
+    // Past a week, a weekday name stops telling you which week it was.
+    #expect(Format.when(at(2026, 7, 3, 10, 0), now: now, calendar: calendar) == "3 Jul")
+}
+
+@Test func moneyFormatting() {
+    #expect(Format.money(4.823) == "$4.82")
+    #expect(Format.money(0) == "$0.00")
+}
+
+// MARK: - Waveform levels
+
+@Test func levelMeterBucketsPeaksIntoBarsOldestFirst() {
+    let meter = LevelMeter()
+    meter.configure(sampleRate: 1000)   // 50 ms bars -> 50 frames per bar
+
+    // Nothing recorded yet: silence, not garbage.
+    #expect(meter.recent(4) == [0, 0, 0, 0])
+
+    // One bar's worth in two callbacks keeps the louder of the two.
+    meter.push(peak: 0.2, frames: 25)
+    #expect(meter.recent(4) == [0, 0, 0, 0])   // bar not closed yet
+    meter.push(peak: 0.8, frames: 25)
+    #expect(meter.recent(4) == [0, 0, 0, 0.8])
+
+    meter.push(peak: 0.4, frames: 50)
+    #expect(meter.recent(4) == [0, 0, 0.8, 0.4])
+    // The window resets, so a quiet bar reads quiet rather than holding the peak.
+    meter.push(peak: 0.1, frames: 50)
+    #expect(meter.recent(2) == [0.4, 0.1])
+}
+
+@Test func levelMeterWrapsAndResets() {
+    let meter = LevelMeter()
+    meter.configure(sampleRate: 1000)
+    for i in 0..<(LevelMeter.capacity + 10) {
+        meter.push(peak: Float(i % 10) / 10, frames: 50)
+    }
+    let recent = meter.recent(3)
+    #expect(recent.count == 3)
+    // Newest bar is the last one pushed.
+    let last = Float((LevelMeter.capacity + 9) % 10) / 10
+    #expect(abs(recent[2] - last) < 0.0001)
+
+    meter.reset()
+    #expect(meter.recent(8).allSatisfy { $0 == 0 })
+}
+
+// MARK: - Session history and usage
+
+private func makeIndex() -> (SessionIndex, URL) {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sessions-test-\(UUID().uuidString)")
+        .appendingPathComponent("sessions.json")
+    return (SessionIndex(url: url), url.deletingLastPathComponent())
+}
+
+private func record(_ title: String, at date: Date, minutes: Double,
+                    cost: Double = 0) -> SessionRecord {
+    SessionRecord(id: UUID().uuidString, title: title, presetName: "Meeting",
+                  startedAt: date, recordedDuration: minutes * 60, costUSD: cost,
+                  notePath: "/tmp/\(title).md")
+}
+
+@Test func sessionIndexKeepsNewestFirstAndTrimsTheTail() throws {
+    let (index, dir) = makeIndex()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let now = Date()
+    index.add(record("older", at: now.addingTimeInterval(-3600), minutes: 10))
+    index.add(record("newer", at: now, minutes: 5))
+    #expect(index.all().map(\.title) == ["newer", "older"])
+
+    for i in 0..<SessionIndex.limit {
+        index.add(record("bulk \(i)", at: now, minutes: 1))
+    }
+    #expect(index.all().count == SessionIndex.limit)
+    #expect(index.all().first?.title == "bulk \(SessionIndex.limit - 1)")
+}
+
+@Test func usageCountsThisMonthOnly() throws {
+    let (index, dir) = makeIndex()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let calendar = Calendar.current
+    let now = Date()
+    let lastMonth = calendar.date(byAdding: .month, value: -1, to: now)!
+    index.add(record("this month", at: now, minutes: 90, cost: 1.20))
+    index.add(record("also this month", at: now, minutes: 30, cost: 0.40))
+    index.add(record("last month", at: lastMonth, minutes: 500, cost: 9.99))
+
+    let usage = index.usage(minuteCap: 600, now: now)
+    #expect(abs(usage.minutesUsed - 120) < 0.001)
+    #expect(abs(usage.costUSD - 1.60) < 0.001)
+    #expect(abs(usage.fraction - 0.2) < 0.001)
+    #expect(!usage.isNearCap)
+    #expect(!usage.isOverCap)
+}
+
+@Test func usageFlagsTheCapWithoutEverBlocking() {
+    let near = Usage(minutesUsed: 480, minuteCap: 600, costUSD: 5, daysLeftInMonth: 3)
+    #expect(near.isNearCap)
+    #expect(!near.isOverCap)
+
+    let over = Usage(minutesUsed: 700, minuteCap: 600, costUSD: 8, daysLeftInMonth: 1)
+    #expect(over.isOverCap)
+    // The bar saturates rather than overflowing.
+    #expect(over.fraction == 1)
+
+    // A cap of zero means no cap; never divide by it.
+    let uncapped = Usage(minutesUsed: 100, minuteCap: 0, costUSD: 1, daysLeftInMonth: 5)
+    #expect(uncapped.fraction == 0)
+    #expect(!uncapped.isOverCap)
+}
+
+@Test func daysLeftCountsTodayAndResetsOnTheFirst() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "Australia/Perth")!
+    func day(_ y: Int, _ m: Int, _ d: Int) -> Date {
+        calendar.date(from: DateComponents(year: y, month: m, day: d, hour: 12))!
+    }
+    // July has 31 days.
+    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 1), calendar: calendar) == 31)
+    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 13), calendar: calendar) == 19)
+    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 31), calendar: calendar) == 1)
+    // February 2028 is a leap year.
+    #expect(SessionIndex.daysLeftInMonth(now: day(2028, 2, 1), calendar: calendar) == 29)
+}
+
+@Test func namingAddsToASessionsCostWithoutDuplicatingIt() throws {
+    let (index, dir) = makeIndex()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let entry = record("Client call", at: Date(), minutes: 30, cost: 0.54)
+    index.add(entry)
+    index.addCost(0.10, toSessionID: entry.id)
+
+    #expect(index.all().count == 1)
+    #expect(abs((index.all().first?.costUSD ?? 0) - 0.64) < 0.001)
+
+    // An unknown id is ignored rather than creating a phantom entry.
+    index.addCost(5, toSessionID: "nope")
+    #expect(index.all().count == 1)
+    #expect(abs((index.all().first?.costUSD ?? 0) - 0.64) < 0.001)
+}
+
 // MARK: - Naming records
 
 @Test func transcriptStoreRoundTripsAndPurges() throws {

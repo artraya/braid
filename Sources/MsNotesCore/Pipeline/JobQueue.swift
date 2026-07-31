@@ -47,6 +47,7 @@ public actor JobQueue {
         public var costTable: CostTable
         public var jobsRoot: URL
         public var transcripts: TranscriptStore
+        public var sessions: SessionIndex
         /// Called on status changes so the UI can react (icon state, notifications).
         public var onEvent: @Sendable (Event) -> Void
 
@@ -54,6 +55,7 @@ public actor JobQueue {
                     costTable: CostTable = .current,
                     jobsRoot: URL = JobQueue.appSupportURL.appendingPathComponent("jobs"),
                     transcripts: TranscriptStore = TranscriptStore(),
+                    sessions: SessionIndex = SessionIndex(),
                     onEvent: @escaping @Sendable (Event) -> Void = { _ in }) {
             self.provider = provider
             self.summariser = summariser
@@ -61,6 +63,7 @@ public actor JobQueue {
             self.costTable = costTable
             self.jobsRoot = jobsRoot
             self.transcripts = transcripts
+            self.sessions = sessions
             self.onEvent = onEvent
         }
     }
@@ -258,6 +261,8 @@ public actor JobQueue {
         }
 
         env.settings.addCost(cost)
+        env.sessions.add(SessionRecord(session: job.session, costUSD: cost,
+                                       notePath: written.noteURL.path))
 
         // Keep the structured Transcript so speakers can be named later. The
         // Vault only holds markdown, and the Recording is about to go.

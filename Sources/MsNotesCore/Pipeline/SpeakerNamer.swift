@@ -20,14 +20,17 @@ public struct SpeakerNamer: Sendable {
     let settings: SettingsStore
     let costTable: CostTable
     let store: TranscriptStore
+    let sessions: SessionIndex
     let log = Logger(subsystem: "no.msnotes.app", category: "pipeline")
 
     public init(summariser: Summariser, settings: SettingsStore,
-                costTable: CostTable = .current, store: TranscriptStore = TranscriptStore()) {
+                costTable: CostTable = .current, store: TranscriptStore = TranscriptStore(),
+                sessions: SessionIndex = SessionIndex()) {
         self.summariser = summariser
         self.settings = settings
         self.costTable = costTable
         self.store = store
+        self.sessions = sessions
     }
 
     /// `names` maps current labels ("Speaker 1") to what the user typed. Blank
@@ -87,6 +90,14 @@ public struct SpeakerNamer: Sendable {
         }
 
         settings.addCost(addedCost)
+        if wroteNewPair {
+            // Same Session id, so this replaces the entry rather than adding
+            // a second one; the list should point at the note that is current.
+            sessions.add(SessionRecord(session: session, costUSD: totalCost,
+                                       notePath: written.noteURL.path))
+        } else {
+            sessions.addCost(addedCost, toSessionID: session.id)
+        }
 
         var updated = record
         updated.session = session

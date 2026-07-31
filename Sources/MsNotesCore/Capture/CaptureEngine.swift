@@ -41,6 +41,8 @@ public final class CaptureEngine: @unchecked Sendable {
     private let keepAlive = SilenceKeepAlive()
     private var micURL: URL?
     private var remoteURL: URL?
+    /// Live peaks for the recording HUD's waveform.
+    public let levels = LevelMeter()
 
     // Written only inside the IOProc / state transitions.
     private var paused = false  // read by IOProc (word-sized read; transitions hold no lock in the RT path)
@@ -160,6 +162,7 @@ public final class CaptureEngine: @unchecked Sendable {
                     "create aggregate device")
 
         let rate = try Self.nominalSampleRate(of: aggregateID)
+        levels.configure(sampleRate: rate)
         let micURL = directory.appendingPathComponent("mic.caf")
         let remoteURL = directory.appendingPathComponent("remote.caf")
         self.micURL = micURL
@@ -181,6 +184,11 @@ public final class CaptureEngine: @unchecked Sendable {
         if paused { return }
         let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
         guard abl.count >= 1 else { return }
+
+        // Loudest of either side this callback, so the waveform answers to both
+        // the user and the far end.
+        var callbackPeak: Float = 0
+        var callbackFrames = 0
 
         for (index, buffer) in abl.enumerated() {
             guard let data = buffer.mData else { continue }
@@ -212,6 +220,11 @@ public final class CaptureEngine: @unchecked Sendable {
                 }
             }
             if isMic { micScratch = scratch } else { remoteScratch = scratch }
+            if peak > callbackPeak { callbackPeak = peak }
+            if isMic { callbackFrames = n }
+        }
+        if callbackFrames > 0 {
+            levels.push(peak: callbackPeak, frames: callbackFrames)
         }
     }
 

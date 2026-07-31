@@ -1,13 +1,16 @@
 import Foundation
 import AppKit
+import Observation
 import ServiceManagement
 import MsNotesCore
 
 /// Bridges the CaptureEngine and JobQueue into UI state. `onChange` fires on
-/// every state mutation so the status item can refresh.
+/// every state mutation so the status item can refresh; SwiftUI observes the
+/// same properties directly.
 /// Icon precedence when states coincide (SPEC Design):
 /// recording/paused (the active Session) > error > processing > idle.
 @MainActor
+@Observable
 final class AppState {
     enum Phase: String { case idle, recording, paused }
 
@@ -17,12 +20,26 @@ final class AppState {
     var lastError: String? { didSet { onChange?() } }
     var currentTitle = ""
     var recordingStartedAt: Date?
-    let settings = SettingsStore()
-    let transcripts = TranscriptStore()
+    let settings: SettingsStore
+    let transcripts: TranscriptStore
+    let sessions: SessionIndex
     var onChange: (() -> Void)?
+
+    /// Injectable so `--ui-preview` can run against a scratch defaults suite
+    /// rather than reading, or writing, the real settings.
+    init(settings: SettingsStore = SettingsStore(),
+         transcripts: TranscriptStore = TranscriptStore(),
+         sessions: SessionIndex = SessionIndex()) {
+        self.settings = settings
+        self.transcripts = transcripts
+        self.sessions = sessions
+    }
 
     /// Finished Sessions whose Remote speakers are still "Speaker 1", "Speaker 2".
     var awaitingNames: [NamingRecord] = [] { didSet { onChange?() } }
+    /// Delivered Sessions, newest first, for the panel's list.
+    var recentSessions: [SessionRecord] = []
+    var usage = Usage.empty
 
     let engine = CaptureEngine()
     private var queue: JobQueue?
@@ -41,15 +58,22 @@ final class AppState {
         return "waveform.circle"
     }
 
-    var keysConfigured: Bool {
-        settings.keychain.get(.assemblyAI) != nil && settings.keychain.get(.anthropic) != nil
-    }
+    /// Cached, not queried on demand: SwiftUI reads `setupComplete` on every
+    /// redraw, and a Keychain lookup per frame is both slow and a good way to
+    /// provoke consent prompts.
+    var keysConfigured = false
 
     var setupComplete: Bool { keysConfigured && settings.vaultPath != nil }
+
+    func refreshKeyState() {
+        keysConfigured = settings.keychain.get(.assemblyAI) != nil
+            && settings.keychain.get(.anthropic) != nil
+    }
 
     // MARK: - Lifecycle
 
     func bootstrap() {
+        refreshKeyState()
         guard queue == nil else { return }
         guard let sttKey = settings.keychain.get(.assemblyAI),
               let claudeKey = settings.keychain.get(.anthropic) else { return }
@@ -59,15 +83,17 @@ final class AppState {
             summariser: summariser,
             settings: settings,
             transcripts: transcripts,
+            sessions: sessions,
             onEvent: { [weak self] event in
                 Task { @MainActor in self?.handle(event) }
             })
         let queue = JobQueue(env: env)
         self.queue = queue
         self.namer = SpeakerNamer(summariser: summariser, settings: settings,
-                                  store: transcripts)
+                                  store: transcripts, sessions: sessions)
         transcripts.purgeExpired()
         refreshNamingState()
+        refreshSessions()
         Task {
             await queue.loadPersisted()
             await self.refreshJobState()
@@ -84,6 +110,7 @@ final class AppState {
         case .jobStarted:
             break
         case .jobDone(_, let noteURL):
+            refreshSessions()
             Notifier.notify(title: "Note ready",
                             body: noteURL.deletingPathExtension().lastPathComponent)
         case .jobFailed(let job, let transient):
@@ -114,6 +141,36 @@ final class AppState {
         awaitingNames = transcripts.all().filter { !$0.namesApplied }
     }
 
+    func refreshSessions() {
+        recentSessions = sessions.recent(20)
+        usage = sessions.usage(minuteCap: settings.monthlyMinuteCap)
+    }
+
+    /// What the Session running right now has cost so far: both Tracks at the
+    /// elapsed recorded duration, plus a flat estimate for the summary. Shown
+    /// live in the HUD, so it is deliberately an estimate and rounds up rather
+    /// than surprising you at the end.
+    var liveCostEstimate: Double {
+        guard let startedAt = recordingStartedAt else { return 0 }
+        let hours = Date().timeIntervalSince(startedAt) / 3600
+        let table = CostTable.current
+        let keyterms = !settings.keyTerms.isEmpty
+        return table.sttCost(trackHours: hours, diarized: false, keyterms: keyterms)
+            + table.sttCost(trackHours: hours, diarized: true, keyterms: keyterms)
+            + table.claudeCost(inputTokens: Int(hours * 9_000), outputTokens: 1_200)
+    }
+
+    /// Opens a Note in Obsidian, falling back to whatever handles markdown.
+    func openNote(at path: String) {
+        let url = URL(fileURLWithPath: path)
+        var components = URLComponents()
+        components.scheme = "obsidian"
+        components.host = "open"
+        components.queryItems = [URLQueryItem(name: "path", value: path)]
+        if let obsidian = components.url, NSWorkspace.shared.open(obsidian) { return }
+        NSWorkspace.shared.open(url)
+    }
+
     // MARK: - Speaker naming
 
     /// Relabels a delivered Session and re-runs the Summariser. Costs one
@@ -128,6 +185,7 @@ final class AppState {
             do {
                 let result = try await namer.apply(names: names, toSessionID: id)
                 self.refreshNamingState()
+                self.refreshSessions()
                 Notifier.notify(
                     title: "Note updated",
                     body: result.wroteNewPair
@@ -206,6 +264,21 @@ final class AppState {
             lastError = "Could not stop recording: \(error)"
             phase = .idle
         }
+    }
+
+    /// Throws the current Session away: stops capture, deletes the Recording,
+    /// queues nothing. The caller confirms first — this is the one action in the
+    /// app that destroys something the user cannot get back.
+    func discard() {
+        guard phase == .recording || phase == .paused, let session = currentSession else { return }
+        let dir = JobQueue.appSupportURL.appendingPathComponent("jobs")
+            .appendingPathComponent(session.id)
+        _ = try? engine.stop()
+        currentSession = nil
+        recordingStartedAt = nil
+        currentTitle = ""
+        phase = .idle
+        try? FileManager.default.removeItem(at: dir)
     }
 
     func retry(jobID: String) {

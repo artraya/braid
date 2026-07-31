@@ -22,6 +22,14 @@ func testKeys() -> (stt: String, claude: String)? {
 func runCLI() -> Bool {
     let args = CommandLine.arguments
 
+if args.contains("--ui-preview") {
+    // Layout check for the panel and HUD; invents its own data, touches nothing.
+    let directory = args.firstIndex(of: "--snapshot").flatMap { i in
+        args.count > i + 1 ? args[i + 1] : nil
+    }
+    MainActor.assumeIsolated { UIPreview.run(snapshotDirectory: directory) }
+}
+
 if let i = args.firstIndex(of: "--record-test") {
     // --record-test <dir> <seconds> [--pause <at> <for>]
     guard args.count > i + 2, let seconds = Double(args[i + 2]) else {

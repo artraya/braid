@@ -1,10 +1,11 @@
 import AppKit
 import MsNotesCore
 
-// AppKit shell (SPEC Design/Architecture: "SwiftUI MenuBarExtra is the
-// expected shell, AppKit acceptable"). The CLT toolchain ships no
-// SwiftUIMacros plugin, so SwiftUI's @State cannot compile without Xcode
-// (ADR-0004); AppKit needs no macros and is lighter anyway.
+// AppKit shell hosting SwiftUI content: AppKit owns the status item, the
+// windows and their lifecycles, SwiftUI draws the Sessions panel, the recording
+// HUD and the naming sheet. The CLT toolchain ships no SwiftUIMacros plugin, so
+// no view may use @State — state lives in @Observable models the controllers
+// own (ADR-0004).
 @main
 struct Entry {
     static func main() {

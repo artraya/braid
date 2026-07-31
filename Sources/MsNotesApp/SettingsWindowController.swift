@@ -15,6 +15,7 @@ final class SettingsWindowController: NSObject {
     private let presetPopup = NSPopUpButton()
     private let presetView = NSTextView()
     private let costLabel = NSTextField(labelWithString: "")
+    private let minuteCapField = NSTextField()
     private var editingPreset = "Meeting"
 
     init(state: AppState) {
@@ -71,6 +72,8 @@ final class SettingsWindowController: NSObject {
             anthropicField,
             label("Key Terms — one per line, sent to the transcriber:"),
             scrollWrap(keyTermsView, height: 70),
+            label("Monthly budget in minutes (shown in the panel; never blocks recording):"),
+            minuteCapField,
             label("Presets:"),
             presetPopup,
             scrollWrap(presetView, height: 150),
@@ -83,6 +86,9 @@ final class SettingsWindowController: NSObject {
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = stack
+        minuteCapField.placeholderString = "600"
+        minuteCapField.translatesAutoresizingMaskIntoConstraints = false
+        minuteCapField.widthAnchor.constraint(equalToConstant: 100).isActive = true
         for view in [vaultRow, assemblyField, anthropicField] {
             view.translatesAutoresizingMaskIntoConstraints = false
             view.widthAnchor.constraint(equalToConstant: 488).isActive = true
@@ -105,6 +111,7 @@ final class SettingsWindowController: NSObject {
         assemblyField.stringValue = state.settings.keychain.get(.assemblyAI) ?? ""
         anthropicField.stringValue = state.settings.keychain.get(.anthropic) ?? ""
         keyTermsView.string = state.settings.keyTerms.joined(separator: "\n")
+        minuteCapField.stringValue = "\(state.settings.monthlyMinuteCap)"
         presetPopup.removeAllItems()
         presetPopup.addItems(withTitles: state.settings.presets.map(\.name))
         editingPreset = state.settings.presets.first?.name ?? "Meeting"
@@ -152,8 +159,12 @@ final class SettingsWindowController: NSObject {
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        if let cap = Int(minuteCapField.stringValue.trimmingCharacters(in: .whitespaces)), cap > 0 {
+            state.settings.monthlyMinuteCap = cap
+        }
         commitPresetEdit()
         state.bootstrap()  // keys may have just become available
+        state.refreshSessions()
         window?.orderOut(nil)
     }
 }

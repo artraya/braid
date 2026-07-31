@@ -1,25 +1,55 @@
 import AppKit
 import MsNotesCore
 
-/// The menu-bar presence: icon (five R15 states) + menu. The menu is rebuilt
-/// each time it opens so it always reflects current state.
+/// The menu-bar presence: icon (five R15 states), the Sessions panel on left
+/// click, and the menu on right click. The menu is rebuilt each time it opens
+/// so it always reflects current state.
 @MainActor
 final class StatusItemController: NSObject, NSMenuDelegate {
     let state: AppState
     let statusItem: NSStatusItem
     let menu = NSMenu()
-    lazy var startPanel = StartPanelController(state: state)
     lazy var settingsWindow = SettingsWindowController(state: state)
     lazy var namingWindow = SpeakerNamingWindowController(state: state)
+    lazy var sessionsPanel = SessionsPanelController(state: state)
+    lazy var recordingHUD = RecordingHUDController(state: state)
 
     init(state: AppState) {
         self.state = state
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
         menu.delegate = self
-        statusItem.menu = menu
-        state.onChange = { [weak self] in self?.refreshIcon() }
+        // No `statusItem.menu`: that would make left click open the menu. The
+        // button handles both buttons itself and pops the menu up on demand.
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        sessionsPanel.onOpenSettings = { [weak self] in self?.settingsTapped() }
+        state.onChange = { [weak self] in
+            self?.refreshIcon()
+            self?.recordingHUD.syncToPhase()
+        }
         refreshIcon()
+    }
+
+    @objc func statusItemClicked() {
+        let isRightClick = NSApp.currentEvent?.type == .rightMouseUp
+            || NSApp.currentEvent?.modifierFlags.contains(.control) == true
+        if isRightClick {
+            showMenu()
+        } else {
+            sessionsPanel.toggle(from: statusItem.button)
+        }
+    }
+
+    private func showMenu() {
+        sessionsPanel.close()
+        // Attaching the menu makes the button pop it up with the system's own
+        // placement and highlight, then it is detached so left click still
+        // belongs to the panel.
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
     }
 
     func refreshIcon() {
@@ -126,7 +156,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: - Actions
 
-    @objc func startTapped() { startPanel.show() }
+    @objc func startTapped() { sessionsPanel.show(from: statusItem.button) }
     @objc func pauseTapped() { state.pause() }
     @objc func resumeTapped() { state.resume() }
     @objc func stopTapped() { state.stop() }

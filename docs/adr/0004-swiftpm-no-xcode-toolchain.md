@@ -5,5 +5,6 @@ The build machine (macOS 27.0, Swift 6.4 CLT) has no Xcode, and installing it (1
 ## Consequences
 
 - The bundle-assembly script is project-owned code (~50 lines) and is the only "build system" beyond SwiftPM; Xcode can still open the package later if GUI debugging is ever wanted.
+- **SwiftUI is usable, but its state property wrappers are not.** The Command Line Tools ship only `libSwiftMacros` and `libObservationMacros`; there is no `SwiftUIMacros` plugin, so `@State` and friends fail to compile with "plugin for module 'SwiftUIMacros' not found". Views therefore hold no state of their own. Each one reads an `@Observable` model owned by the AppKit controller that presents it, and passes explicit `Binding(get:set:)` values down. Observation drives the redraws, so this costs nothing at runtime and keeps views as pure functions of a model. Adding `@State` anywhere means requiring Xcode, which is a decision to revisit this ADR.
 - The self-signed identity exists only on this machine — reinstalling macOS or moving machines means re-creating it and re-granting permissions (acceptable: non-goal #6, no distribution).
 - Adding any SPM dependency is a deliberate decision to revisit this ADR, not a routine import.
