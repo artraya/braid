@@ -88,6 +88,10 @@ transcript and re-runs the summary, about ten cents. Nothing is guessed for you:
 two names and two voices is a coin flip, and a confidently wrong name is worse
 than Speaker 1. The note lands first either way, so you can ignore the prompt.
 
+Started something by mistake? **Cancel it** from the panel while it is
+processing and it stops before paying for anything it has not already used. The
+audio is kept, so you can send it through after all or delete it deliberately.
+
 Recording **stops by itself** when your call app lets go of the microphone,
 after a thirty second countdown you can cancel. Starting is always your call.
 It only watches once a call app has actually taken the mic, so dictation is
