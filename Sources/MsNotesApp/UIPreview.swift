@@ -41,6 +41,54 @@ enum UIPreview {
         exit(0)
     }
 
+    /// Verifies the whole sizing chain a real panel goes through — SwiftUI
+    /// lays out, the window adopts that size, the window hangs from the menu
+    /// bar — without needing a status item or a click to drive it.
+    ///
+    /// The bug this exists to catch: the window keeps its placeholder height,
+    /// SwiftUI centres the content inside it, and the panel appears to float
+    /// below the menu bar with dead space above it.
+    private static func checkGeometry() -> Bool {
+        var ok = true
+        func check(_ label: String, _ condition: Bool, _ detail: String) {
+            print("\(condition ? "ok  " : "FAIL") \(label): \(detail)")
+            if !condition { ok = false }
+        }
+
+        let placeholderHeight: CGFloat = 480
+        for (name, sessions) in [("populated", previewSessions), ("empty", [SessionRecord]())] {
+            let panel = FloatingPanel(
+                contentRect: NSRect(x: 0, y: 0, width: Theme.panelWidth, height: placeholderHeight),
+                draggable: false)
+            panel.setContent(SessionsPanelPreview(sessions: sessions, usage: previewUsage))
+            panel.layoutIfNeeded()
+            panel.fitToContent()
+
+            let fitted = panel.contentSize ?? .zero
+            check("\(name): window height follows content",
+                  abs(panel.frame.height - fitted.height) < 1,
+                  "window \(Int(panel.frame.height)) vs content \(Int(fitted.height))")
+            check("\(name): placeholder height discarded",
+                  abs(panel.frame.height - placeholderHeight) > 1 || fitted.height == placeholderHeight,
+                  "height \(Int(panel.frame.height))")
+
+            // Hang it from a synthetic menu bar and confirm it is flush.
+            let screen = CGRect(x: 0, y: 0, width: 2560, height: 1416)
+            let placement = PanelGeometry.place(
+                panelSize: panel.frame.size, iconCentreX: 2049,
+                menuBarBottomY: screen.maxY, screen: screen)
+            panel.setFrameTopLeftPoint(placement.topLeft)
+            check("\(name): top edge flush with the menu bar",
+                  abs(panel.frame.maxY - screen.maxY) < 1,
+                  "gap \(Int(screen.maxY - panel.frame.maxY))pt")
+            check("\(name): arrow points at the icon",
+                  abs((panel.frame.minX + placement.arrowX) - 2049) < 1,
+                  "arrow at \(Int(panel.frame.minX + placement.arrowX)), icon at 2049")
+        }
+        print(ok ? "PANEL-GEOMETRY-OK" : "PANEL-GEOMETRY-FAILED")
+        return ok
+    }
+
     /// Renders each view offscreen and writes it as a PNG. The view has to live
     /// in a real window briefly or SwiftUI never lays it out.
     private static func snapshot(into directory: URL) {
