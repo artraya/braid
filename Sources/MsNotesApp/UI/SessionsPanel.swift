@@ -12,6 +12,10 @@ final class SessionsPanelModel {
     var title = ""
     var participants = ""
     var presetName = ""
+    /// Where the pointer sits, measured from the panel's left edge. Updated
+    /// whenever the panel is placed, since it is clamped to the screen while
+    /// the menu bar icon is not.
+    var arrowX: CGFloat = Theme.panelWidth / 2
 
     func resetForm(defaultPreset: String) {
         title = ""
@@ -26,6 +30,8 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     private let state: AppState
     private let model = SessionsPanelModel()
     private var panel: FloatingPanel?
+    private var anchor: MenuBarAnchor?
+    private var shownAt: Date?
     /// Set by StatusItemController so Settings and Quit stay reachable from the
     /// panel as well as the right-click menu.
     var onOpenSettings: (() -> Void)?
@@ -48,13 +54,32 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
 
         let panel = self.panel ?? makePanel()
         self.panel = panel
+        anchor = MenuBarAnchor(statusItemButton: button) ?? anchor
         panel.layoutIfNeeded()
-        panel.position(below: button)
+        reposition()
+        shownAt = Date()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // Content settles a beat after the window is on screen; re-hang it so
+        // the final height still hangs from the menu bar.
+        DispatchQueue.main.async { [weak self] in self?.reposition() }
+    }
+
+    /// Re-hangs the panel and points the arrow at the icon. Called on every
+    /// resize as well as on show: SwiftUI sizes the window to its content after
+    /// the fact, and the start form changes that height while it is open.
+    private func reposition() {
+        guard let panel, let anchor else { return }
+        model.arrowX = panel.hang(from: anchor)
+        panel.invalidateShadow()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        reposition()
     }
 
     func close() {
+        shownAt = nil
         panel?.orderOut(nil)
     }
 
@@ -107,7 +132,12 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     }
 
     /// Clicking away dismisses the panel, the way a menu would.
+    ///
+    /// Ignored for a moment after showing: activating the app hands key status
+    /// around while the panel is still appearing, and acting on that resign
+    /// closed the panel the instant it opened.
     func windowDidResignKey(_ notification: Notification) {
+        guard let shownAt, Date().timeIntervalSince(shownAt) > 0.4 else { return }
         close()
     }
 }
@@ -136,7 +166,7 @@ struct SessionsPanelView: View {
         }
         .padding(Theme.padding)
         .frame(width: Theme.panelWidth)
-        .panelSurface()
+        .panelSurface(arrowX: model.arrowX)
         .preferredColorScheme(.dark)
     }
 

@@ -53,6 +53,11 @@ enum UIPreview {
                                    pendingJobs: [previewJob("Weekly sync", minutes: 41)],
                                    cancelledJobs: [previewJob("Another Test", minutes: 80)]),
               named: "panel-processing", into: directory)
+        // The arrow near the right edge, as it sits when the icon is far right
+        // and the panel has been clamped inward.
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   arrowX: Theme.panelWidth - 34),
+              named: "panel-arrow-right", into: directory)
         write(RecordingHUDPreview(), named: "hud", into: directory)
         write(RecordingHUDPreview(paused: true), named: "hud-paused", into: directory)
         write(RecordingHUDPreview(autoEndIn: 24), named: "hud-auto-end", into: directory)
@@ -145,6 +150,7 @@ private struct SessionsPanelPreview: View {
     var startFormOpen = false
     var pendingJobs: [Job] = []
     var cancelledJobs: [Job] = []
+    var arrowX: CGFloat?
 
     var body: some View {
         let state = UIPreview.scratchState()
@@ -156,6 +162,7 @@ private struct SessionsPanelPreview: View {
         let model = SessionsPanelModel()
         model.presetName = "Meeting"
         model.showingStartForm = startFormOpen
+        model.arrowX = arrowX ?? Theme.panelWidth / 2
         return SessionsPanelView(state: state, model: model,
                                  onStart: {}, onOpenSettings: {}, onOpenNote: { _ in },
                                  onCancelJob: { _ in }, onRetryJob: { _ in },

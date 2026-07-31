@@ -496,6 +496,65 @@ private func firings(_ detector: inout CallEndDetector,
     #expect(!CallWatcher.matches("us.zoom.xos", watched: "com.apple.Safari"))
 }
 
+// MARK: - Panel placement
+
+/// A 2560x1440 screen with a 24pt menu bar, and a 380pt panel.
+private let testScreen = CGRect(x: 0, y: 0, width: 2560, height: 1416)
+private let testPanel = CGSize(width: 380, height: 300)
+private let menuBarBottom: CGFloat = 1416
+
+@Test func panelHangsFromTheMenuBarCentredUnderItsIcon() {
+    let placement = PanelGeometry.place(
+        panelSize: testPanel, iconCentreX: 1280,
+        menuBarBottomY: menuBarBottom, screen: testScreen)
+    // Flush with the menu bar: no floating gap.
+    #expect(placement.topLeft.y == menuBarBottom)
+    #expect(placement.topLeft.x == CGFloat(1090))
+    // Arrow lands dead centre, pointing at the icon.
+    #expect(placement.arrowX == CGFloat(190))
+}
+
+@Test func panelStaysOnScreenAndTheArrowFollowsTheIcon() {
+    // A menu bar item near the right edge, where the panel must be pulled in.
+    let placement = PanelGeometry.place(
+        panelSize: testPanel, iconCentreX: 2500,
+        menuBarBottomY: menuBarBottom, screen: testScreen)
+    #expect(placement.topLeft.x == CGFloat(2172))   // clamped, not centred
+    #expect(placement.topLeft.x + testPanel.width <= testScreen.maxX)
+    // The panel moved but the icon did not, so the arrow must not stay centred.
+    #expect(placement.arrowX == CGFloat(328))
+    #expect(placement.arrowX > testPanel.width / 2)
+    // Still points at the actual icon.
+    #expect(placement.topLeft.x + placement.arrowX == CGFloat(2500))
+}
+
+@Test func panelClampsAtTheLeftEdgeToo() {
+    let placement = PanelGeometry.place(
+        panelSize: testPanel, iconCentreX: 30,
+        menuBarBottomY: menuBarBottom, screen: testScreen)
+    #expect(placement.topLeft.x == 8)
+    #expect(placement.arrowX == 22)
+}
+
+@Test func panelPlacementSurvivesAScreenNarrowerThanItself() {
+    let narrow = CGRect(x: 0, y: 0, width: 300, height: 800)
+    let placement = PanelGeometry.place(
+        panelSize: testPanel, iconCentreX: 150,
+        menuBarBottomY: 800, screen: narrow)
+    // Bounds cross; stay inside the left edge rather than jumping off-screen.
+    #expect(placement.topLeft.x == 8)
+}
+
+@Test func panelPlacementRespectsASecondScreenOffset() {
+    // A display to the right of the primary one: coordinates do not start at 0.
+    let second = CGRect(x: 2560, y: 0, width: 1920, height: 1080)
+    let placement = PanelGeometry.place(
+        panelSize: testPanel, iconCentreX: 4460,
+        menuBarBottomY: 1056, screen: second)
+    #expect(placement.topLeft.x == CGFloat(4092))
+    #expect(placement.topLeft.x + placement.arrowX == CGFloat(4460))
+}
+
 // MARK: - Display formatting
 
 @Test func durationAndClockFormatting() {

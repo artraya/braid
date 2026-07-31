@@ -21,15 +21,62 @@ enum Theme {
     static let corner: CGFloat = 16
     static let cardCorner: CGFloat = 12
     static let padding: CGFloat = 16
+    /// The pointer that ties the Sessions panel to its menu bar icon.
+    static let arrowHeight: CGFloat = 9
+    static let arrowWidth: CGFloat = 20
+}
+
+/// The panel outline: a rounded rectangle with a triangle on top pointing at
+/// the menu bar icon. Drawn as one continuous path rather than a rectangle with
+/// a triangle laid over it, so the border strokes cleanly around the point
+/// instead of showing a seam where the two shapes meet.
+///
+/// `arrowX` is measured from the panel's left edge, because the panel gets
+/// clamped away from the screen edge while the icon stays where it is.
+struct PanelShape: Shape {
+    var arrowX: CGFloat
+    var showsArrow = true
+
+    func path(in rect: CGRect) -> Path {
+        let arrowHeight = showsArrow ? Theme.arrowHeight : 0
+        let halfArrow = Theme.arrowWidth / 2
+        let top = rect.minY + arrowHeight
+        let radius = min(Theme.corner, (rect.height - arrowHeight) / 2, rect.width / 2)
+        // Keep the point clear of the rounded corners.
+        let tip = min(max(arrowX, radius + halfArrow), rect.width - radius - halfArrow)
+
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + radius, y: top))
+        if showsArrow {
+            path.addLine(to: CGPoint(x: tip - halfArrow, y: top))
+            path.addLine(to: CGPoint(x: tip, y: rect.minY))
+            path.addLine(to: CGPoint(x: tip + halfArrow, y: top))
+        }
+        path.addLine(to: CGPoint(x: rect.maxX - radius, y: top))
+        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: top),
+                    tangent2End: CGPoint(x: rect.maxX, y: top + radius), radius: radius)
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - radius))
+        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.maxY),
+                    tangent2End: CGPoint(x: rect.maxX - radius, y: rect.maxY), radius: radius)
+        path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+        path.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.maxY),
+                    tangent2End: CGPoint(x: rect.minX, y: rect.maxY - radius), radius: radius)
+        path.addLine(to: CGPoint(x: rect.minX, y: top + radius))
+        path.addArc(tangent1End: CGPoint(x: rect.minX, y: top),
+                    tangent2End: CGPoint(x: rect.minX + radius, y: top), radius: radius)
+        path.closeSubpath()
+        return path
+    }
 }
 
 extension View {
     /// The dark rounded surface both floating windows sit on. The border keeps
     /// the panel's edge visible against a dark desktop.
-    func panelSurface(_ fill: Color = Theme.panel) -> some View {
-        background(fill, in: RoundedRectangle(cornerRadius: Theme.corner, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.corner, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+    func panelSurface(_ fill: Color = Theme.panel,
+                      arrowX: CGFloat? = nil) -> some View {
+        let shape = PanelShape(arrowX: arrowX ?? 0, showsArrow: arrowX != nil)
+        return padding(.top, arrowX != nil ? Theme.arrowHeight : 0)
+            .background(shape.fill(fill))
+            .overlay(shape.stroke(Color.white.opacity(0.08), lineWidth: 1))
     }
 }
