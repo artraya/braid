@@ -4,6 +4,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 swift build "$@"
-BIN="$(swift build --show-bin-path "$@")/MsNotesApp"
-codesign --force --sign "ms-notes Development" --identifier "no.msnotes.app" "$BIN"
+BIN="$(swift build --show-bin-path "$@")/BraidApp"
+codesign --force --sign "ms-notes Development" --identifier "no.braid.app" "$BIN"
 echo "signed: $BIN"

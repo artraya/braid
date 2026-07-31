@@ -1,4 +1,4 @@
-# ms-notes
+# Braid
 
 Record a meeting. Get notes in your Obsidian vault. That is the whole app.
 
@@ -9,7 +9,9 @@ audio is deleted once the note is safely written.
 
 No bot joins your call. No subscription. Nothing to check afterwards.
 
-![the app icon](docs/icon.png)
+<img src="docs/icon.png" alt="the Braid icon" width="128">
+
+Two audio tracks, braided into one transcript and one note.
 
 ## Why this exists
 
@@ -46,19 +48,21 @@ You need macOS 27, the Swift command line tools (not Xcode), an
 [Anthropic](https://console.anthropic.com) key.
 
 ```bash
-git clone https://github.com/artraya/ms-notes.git
-cd ms-notes
+git clone https://github.com/artraya/braid.git
+cd braid
 
 cp .env.example .env          # add your two API keys
-./scripts/build-app.sh        # builds dist/ms-notes.app
-cp -R dist/ms-notes.app /Applications/
+./scripts/build-app.sh        # builds dist/Braid.app
+cp -R dist/Braid.app /Applications/
 ./scripts/load-keys.sh        # moves the keys into the Keychain
 ```
 
 Open the app, click the menu bar icon, and set your vault folder in Settings.
 On your first recording macOS asks for Microphone and System Audio Recording.
 
-The build signs the app with a local identity called `ms-notes Development`.
+The build signs the app with a local identity called `ms-notes Development`,
+named before the app was, and kept because renaming a signing identity is what
+makes macOS forget your permissions.
 Create one in Keychain Access, or edit `scripts/build-app.sh` to use your own.
 A stable identity matters, because without it macOS treats every rebuild as a
 brand new app and forgets your permissions.
@@ -72,9 +76,18 @@ note in Obsidian. Record expands it into the start form.
 
 While recording, the same panel gains a block at the top with the clock, a live
 waveform, pause, stop and discard. Click the icon to tuck it away and the
-recording carries on; click again to bring it back. Naming speakers, settings
-and every confirmation happen in there too, so the app never opens a second
-window. Right click the icon for a short menu of shortcuts.
+recording carries on; click again to bring it back.
+
+| idle | recording |
+|---|---|
+| <img src="docs/screenshots/panel.png" width="330"> | <img src="docs/screenshots/panel-recording.png" width="330"> |
+
+Naming speakers, settings and every confirmation happen in there too, so the app
+never opens a second window. Right click the icon for a short menu of shortcuts.
+
+| name speakers | settings | anything irreversible |
+|---|---|---|
+| <img src="docs/screenshots/panel-naming.png" width="240"> | <img src="docs/screenshots/panel-settings.png" width="240"> | <img src="docs/screenshots/panel-confirm.png" width="240"> |
 
 Pick a **preset** when you start recording: Meeting, Lecture, Interview or
 Training. Each one is a prompt template that shapes the note, and all four are
@@ -94,6 +107,8 @@ than Speaker 1. The note lands first either way, so you can ignore the prompt.
 Started something by mistake? **Cancel it** from the panel while it is
 processing and it stops before paying for anything it has not already used. The
 audio is kept, so you can send it through after all or delete it deliberately.
+
+<img src="docs/screenshots/panel-processing.png" width="330">
 
 Recording **stops by itself** when your call app lets go of the microphone,
 after a thirty second countdown you can cancel. Starting is always your call.
@@ -155,16 +170,19 @@ of your own voice. The running total is shown in the app.
 ## Project layout
 
 ```
-Sources/MsNotesCore/   capture engine, call watcher, provider adapters, pipeline
-Sources/MsNotesApp/    menu bar app, SwiftUI panel and HUD, headless test modes
-Sources/MsNotesApp/UI/ the Sessions panel, recording HUD and their theme
-Tests/                 unit tests
-scripts/               build, install, icon and key helpers
-docs/adr/              why the difficult decisions went the way they did
+Sources/BraidCore/    capture engine, call watcher, provider adapters, pipeline
+Sources/BraidApp/     menu bar app and headless test modes
+Sources/BraidApp/UI/  the panel: every view the app has
+Tests/                unit tests
+scripts/              build, install, icon and key helpers
+docs/adr/             why the difficult decisions went the way they did
 ```
 
 ```bash
-./scripts/test.sh    # run the tests
+./scripts/test.sh                              # unit tests
+./.build/debug/BraidApp --ui-preview           # every panel view, on screen
+./.build/debug/BraidApp --ui-preview --snapshot docs/screenshots
+./.build/debug/BraidApp --ui-preview --check-geometry
 ```
 
 ## Status
