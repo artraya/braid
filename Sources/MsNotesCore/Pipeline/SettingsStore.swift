@@ -45,6 +45,22 @@ public struct SettingsStore: Sendable {
         nonmutating set { defaults.set(max(0, newValue), forKey: "monthlyMinuteCap") }
     }
 
+    /// Stop recording by itself when the call app lets go of the microphone.
+    /// Starting is always deliberate; only stopping is automated.
+    public var autoEndEnabled: Bool {
+        get { defaults.object(forKey: "autoEndEnabled") as? Bool ?? true }
+        nonmutating set { defaults.set(newValue, forKey: "autoEndEnabled") }
+    }
+
+    /// Bundle IDs treated as call apps, matched as prefixes.
+    public var callAppBundleIDs: [String] {
+        get {
+            let stored = defaults.stringArray(forKey: "callAppBundleIDs") ?? []
+            return stored.isEmpty ? CallWatcher.defaultBundleIDs : stored
+        }
+        nonmutating set { defaults.set(newValue, forKey: "callAppBundleIDs") }
+    }
+
     /// Running cost total in USD (SPEC R14).
     public var costTotalUSD: Double {
         get { defaults.double(forKey: "costTotalUSD") }

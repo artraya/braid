@@ -41,10 +41,16 @@ final class AppState {
     var recentSessions: [SessionRecord] = []
     var usage = Usage.empty
 
+    /// Set when a call app has let go of the mic and the Session is about to
+    /// stop by itself. The HUD counts down against it and offers a way out.
+    var autoEndDeadline: Date? { didSet { onChange?() } }
+
     let engine = CaptureEngine()
     private var queue: JobQueue?
     private var currentSession: Session?
     private var namer: SpeakerNamer?
+    private var callWatcher: CallWatcher?
+    private var autoEndTimer: Timer?
 
     /// SF Symbol per state (R15: five distinct states).
     var iconName: String {
@@ -222,9 +228,66 @@ final class AppState {
             recordingStartedAt = session.startedAt
             lastError = nil
             phase = .recording
+            startCallWatcher()
         } catch {
             lastError = "Could not start recording: \(error)"
         }
+    }
+
+    // MARK: - Auto-end
+
+    /// How long the HUD counts down before stopping on its own.
+    static let autoEndGrace: TimeInterval = 30
+
+    private func startCallWatcher() {
+        guard settings.autoEndEnabled else { return }
+        let watcher = CallWatcher(bundleIDs: settings.callAppBundleIDs) { [weak self] in
+            Task { @MainActor in self?.callEnded() }
+        }
+        callWatcher = watcher
+        watcher.start()
+    }
+
+    private func stopCallWatcher() {
+        callWatcher?.stop()
+        callWatcher = nil
+        cancelAutoEndTimer()
+        autoEndDeadline = nil
+    }
+
+    private func cancelAutoEndTimer() {
+        autoEndTimer?.invalidate()
+        autoEndTimer = nil
+    }
+
+    /// The call app released the microphone. Warn rather than stop outright: a
+    /// false positive that ends a live meeting is far worse than a recording
+    /// that runs 30 seconds long.
+    private func callEnded() {
+        guard phase == .recording || phase == .paused, autoEndDeadline == nil else { return }
+        let deadline = Date().addingTimeInterval(Self.autoEndGrace)
+        autoEndDeadline = deadline
+        Notifier.notify(title: "Call ended",
+                        body: "Stopping in \(Int(Self.autoEndGrace)) seconds. Open ms-notes to keep recording.")
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.autoEndFired() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        autoEndTimer = timer
+    }
+
+    private func autoEndFired() {
+        guard autoEndDeadline != nil, phase == .recording || phase == .paused else { return }
+        autoEndDeadline = nil
+        stop()
+    }
+
+    /// "Keep recording": stand the countdown down and wait for a fresh call
+    /// before arming again.
+    func cancelAutoEnd() {
+        cancelAutoEndTimer()
+        autoEndDeadline = nil
+        callWatcher?.keepRecording()
     }
 
     func pause() {
@@ -244,6 +307,7 @@ final class AppState {
 
     func stop() {
         guard phase == .recording || phase == .paused, var session = currentSession else { return }
+        stopCallWatcher()
         do {
             let result = try engine.stop()
             session.recordedDuration = result.recordedDuration
@@ -271,6 +335,7 @@ final class AppState {
     /// app that destroys something the user cannot get back.
     func discard() {
         guard phase == .recording || phase == .paused, let session = currentSession else { return }
+        stopCallWatcher()
         let dir = JobQueue.appSupportURL.appendingPathComponent("jobs")
             .appendingPathComponent(session.id)
         _ = try? engine.stop()

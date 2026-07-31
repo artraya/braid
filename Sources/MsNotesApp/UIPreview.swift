@@ -51,6 +51,7 @@ enum UIPreview {
               named: "panel-empty", into: directory)
         write(RecordingHUDPreview(), named: "hud", into: directory)
         write(RecordingHUDPreview(paused: true), named: "hud-paused", into: directory)
+        write(RecordingHUDPreview(autoEndIn: 24), named: "hud-auto-end", into: directory)
     }
 
     private static func write(_ view: some View, named name: String, into directory: URL) {
@@ -150,6 +151,7 @@ private struct SessionsPanelPreview: View {
 @MainActor
 private struct RecordingHUDPreview: View {
     var paused = false
+    var autoEndIn: Int?
 
     var body: some View {
         let state = AppState()
@@ -159,6 +161,7 @@ private struct RecordingHUDPreview: View {
         let model = RecordingHUDModel()
         model.elapsed = 736
         model.costEstimate = 0.11
+        model.autoEndIn = autoEndIn
         // A plausible speech envelope rather than noise, so the bar scaling can
         // actually be judged.
         model.levels = (0..<RecordingHUDController.barCount).map { i in
@@ -167,7 +170,8 @@ private struct RecordingHUDPreview: View {
             return Float(max(0.04, phrase * breath * 0.8))
         }
         return RecordingHUDView(state: state, model: model,
-                                onPauseResume: {}, onStop: {}, onDiscard: {})
+                                onPauseResume: {}, onStop: {}, onDiscard: {},
+                                onKeepRecording: {})
             .padding(20)
     }
 }

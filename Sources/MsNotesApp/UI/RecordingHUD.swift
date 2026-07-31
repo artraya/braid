@@ -12,7 +12,8 @@ final class RecordingHUDModel {
     var elapsed: TimeInterval = 0
     var levels: [Float] = []
     var costEstimate: Double = 0
-    var confirmingDiscard = false
+    /// Seconds until the Session stops by itself, or nil when nothing is pending.
+    var autoEndIn: Int?
 }
 
 @MainActor
@@ -65,7 +66,7 @@ final class RecordingHUDController: NSObject {
     private func hide() {
         stopTimer()
         if let panel, panel.isVisible { lastOrigin = panel.frame.origin }
-        model.confirmingDiscard = false
+        model.autoEndIn = nil
         panel?.orderOut(nil)
     }
 
@@ -81,7 +82,11 @@ final class RecordingHUDController: NSObject {
                 self.state.phase == .paused ? self.state.resume() : self.state.pause()
             },
             onStop: { [weak self] in self?.state.stop() },
-            onDiscard: { [weak self] in self?.state.discard() }))
+            onDiscard: { [weak self] in self?.state.discard() },
+            onKeepRecording: { [weak self] in
+                self?.state.cancelAutoEnd()
+                self?.tick()
+            }))
         return panel
     }
 
@@ -106,6 +111,9 @@ final class RecordingHUDController: NSObject {
         if let startedAt = state.recordingStartedAt, state.phase == .recording {
             model.elapsed = Date().timeIntervalSince(startedAt)
         }
+        model.autoEndIn = state.autoEndDeadline.map {
+            max(0, Int($0.timeIntervalSinceNow.rounded(.up)))
+        }
     }
 }
 
@@ -115,11 +123,15 @@ struct RecordingHUDView: View {
     let onPauseResume: () -> Void
     let onStop: () -> Void
     let onDiscard: () -> Void
+    let onKeepRecording: () -> Void
 
     private var paused: Bool { state.phase == .paused }
 
     var body: some View {
         VStack(spacing: 12) {
+            if let seconds = model.autoEndIn {
+                autoEndBanner(seconds)
+            }
             statusLine
             Text(Format.clock(model.elapsed))
                 .font(.system(size: 40, weight: .bold, design: .rounded))
@@ -152,6 +164,28 @@ struct RecordingHUDView: View {
             startPoint: .top, endPoint: .center)
         .background(Theme.panel)
         .clipShape(RoundedRectangle(cornerRadius: Theme.corner, style: .continuous))
+    }
+
+    /// Shown when the call app has let go of the mic. The way out is right
+    /// here rather than buried in a notification that may already be gone.
+    private func autoEndBanner(_ seconds: Int) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "phone.down.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.recording)
+            Text("Call ended — stopping in \(seconds)s")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.text)
+            Spacer(minLength: 4)
+            Button("Keep recording", action: onKeepRecording)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.recording.opacity(0.16),
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 
     private var statusLine: some View {

@@ -16,6 +16,8 @@ final class SettingsWindowController: NSObject {
     private let presetView = NSTextView()
     private let costLabel = NSTextField(labelWithString: "")
     private let minuteCapField = NSTextField()
+    private let autoEndCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let callAppsView = NSTextView()
     private var editingPreset = "Meeting"
 
     init(state: AppState) {
@@ -74,6 +76,9 @@ final class SettingsWindowController: NSObject {
             scrollWrap(keyTermsView, height: 70),
             label("Monthly budget in minutes (shown in the panel; never blocks recording):"),
             minuteCapField,
+            autoEndCheckbox,
+            label("Call apps to watch — one bundle ID per line, matched as a prefix:"),
+            scrollWrap(callAppsView, height: 70),
             label("Presets:"),
             presetPopup,
             scrollWrap(presetView, height: 150),
@@ -86,6 +91,7 @@ final class SettingsWindowController: NSObject {
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = stack
+        autoEndCheckbox.title = "Stop recording 30s after the call app releases the microphone"
         minuteCapField.placeholderString = "600"
         minuteCapField.translatesAutoresizingMaskIntoConstraints = false
         minuteCapField.widthAnchor.constraint(equalToConstant: 100).isActive = true
@@ -112,6 +118,8 @@ final class SettingsWindowController: NSObject {
         anthropicField.stringValue = state.settings.keychain.get(.anthropic) ?? ""
         keyTermsView.string = state.settings.keyTerms.joined(separator: "\n")
         minuteCapField.stringValue = "\(state.settings.monthlyMinuteCap)"
+        autoEndCheckbox.state = state.settings.autoEndEnabled ? .on : .off
+        callAppsView.string = state.settings.callAppBundleIDs.joined(separator: "\n")
         presetPopup.removeAllItems()
         presetPopup.addItems(withTitles: state.settings.presets.map(\.name))
         editingPreset = state.settings.presets.first?.name ?? "Meeting"
@@ -162,6 +170,11 @@ final class SettingsWindowController: NSObject {
         if let cap = Int(minuteCapField.stringValue.trimmingCharacters(in: .whitespaces)), cap > 0 {
             state.settings.monthlyMinuteCap = cap
         }
+        state.settings.autoEndEnabled = autoEndCheckbox.state == .on
+        state.settings.callAppBundleIDs = callAppsView.string
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
         commitPresetEdit()
         state.bootstrap()  // keys may have just become available
         state.refreshSessions()

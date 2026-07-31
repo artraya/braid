@@ -252,6 +252,76 @@ import Testing
     #expect(renamed.utterances.map(\.speaker) == ["Me", "Sarah", "Speaker 2", "Speaker 3"])
 }
 
+// MARK: - Auto-end detection
+
+/// Feeds a detector a sequence of (secondsFromStart, callAppHoldingMic) and
+/// returns the offsets at which it judged the call to have ended.
+private func firings(_ detector: inout CallEndDetector,
+                     _ samples: [(TimeInterval, Bool)]) -> [TimeInterval] {
+    let start = Date(timeIntervalSince1970: 1_790_000_000)
+    var fired: [TimeInterval] = []
+    for (offset, holding) in samples {
+        if detector.update(callAppHoldingMic: holding,
+                           now: start.addingTimeInterval(offset)) {
+            fired.append(offset)
+        }
+    }
+    return fired
+}
+
+@Test func autoEndNeverFiresWithoutACallAppFirst() {
+    // Dictating into a quiet room: no call app ever takes the mic.
+    var detector = CallEndDetector(grace: 15)
+    let samples = stride(from: 0.0, through: 600, by: 2).map { ($0, false) }
+    #expect(firings(&detector, samples).isEmpty)
+    #expect(!detector.armed)
+}
+
+@Test func autoEndFiresOnceAfterTheGracePeriod() {
+    var detector = CallEndDetector(grace: 15)
+    var samples: [(TimeInterval, Bool)] = stride(from: 0.0, to: 60, by: 2).map { ($0, true) }
+    samples += stride(from: 60.0, through: 120, by: 2).map { ($0, false) }
+    let fired = firings(&detector, samples)
+    // Released at 60, so it fires on the first sample at or past 75.
+    #expect(fired == [76])
+    #expect(!detector.armed)
+}
+
+@Test func autoEndRidesOutAReconnect() {
+    var detector = CallEndDetector(grace: 15)
+    var samples: [(TimeInterval, Bool)] = [(0, true), (2, true)]
+    // Teams drops for 8 seconds and comes back: shorter than the grace period.
+    samples += [(4, false), (6, false), (8, false), (10, false), (12, true), (14, true)]
+    #expect(firings(&detector, samples).isEmpty)
+    #expect(detector.armed)
+}
+
+@Test func keepRecordingDisarmsUntilTheNextCall() {
+    var detector = CallEndDetector(grace: 15)
+    _ = firings(&detector, [(0, true), (2, true)])
+
+    // The user says keep recording while the app is still off the mic.
+    detector.reset()
+    #expect(firings(&detector, stride(from: 4.0, through: 300, by: 2).map { ($0, false) }).isEmpty)
+
+    // A fresh call arms it again, and ending that one does fire.
+    var samples: [(TimeInterval, Bool)] = [(302, true), (304, true)]
+    samples += stride(from: 306.0, through: 340, by: 2).map { ($0, false) }
+    #expect(firings(&detector, samples) == [322])
+}
+
+@Test func callAppMatchingCoversHelpersAndVersionedBundles() {
+    // Browsers and Electron apps open the mic from a helper process.
+    #expect(CallWatcher.matches("com.google.Chrome.helper", watched: "com.google.Chrome"))
+    #expect(CallWatcher.matches("com.microsoft.edgemac.helper", watched: "com.microsoft.edgemac"))
+    #expect(CallWatcher.matches("com.microsoft.teams", watched: "com.microsoft.teams"))
+    // The current Teams client is "teams2".
+    #expect(CallWatcher.matches("com.microsoft.teams2", watched: "com.microsoft.teams"))
+    // A prefix must not swallow an unrelated app.
+    #expect(!CallWatcher.matches("com.google.ChromeRemoteDesktop", watched: "com.google.Chrome"))
+    #expect(!CallWatcher.matches("us.zoom.xos", watched: "com.apple.Safari"))
+}
+
 // MARK: - Display formatting
 
 @Test func durationAndClockFormatting() {
