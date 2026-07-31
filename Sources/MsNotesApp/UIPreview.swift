@@ -49,6 +49,10 @@ enum UIPreview {
               named: "panel-start-form", into: directory)
         write(SessionsPanelPreview(sessions: [], usage: Usage.empty),
               named: "panel-empty", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   pendingJobs: [previewJob("Weekly sync", minutes: 41)],
+                                   cancelledJobs: [previewJob("Another Test", minutes: 80)]),
+              named: "panel-processing", into: directory)
         write(RecordingHUDPreview(), named: "hud", into: directory)
         write(RecordingHUDPreview(paused: true), named: "hud-paused", into: directory)
         write(RecordingHUDPreview(autoEndIn: 24), named: "hud-auto-end", into: directory)
@@ -84,6 +88,12 @@ enum UIPreview {
             sample("Book chapter dictation", minutesAgo: 60 * 52, duration: 3063, cost: 3.02),
             sample("Site handover", minutesAgo: 60 * 120, duration: 640, cost: 0.72),
         ]
+    }
+
+    private static func previewJob(_ title: String, minutes: Double) -> Job {
+        Job(session: Session(title: title, presetName: "Meeting", participants: [],
+                             startedAt: Date(), recordedDuration: minutes * 60),
+            remoteSilent: false)
     }
 
     private static var previewUsage: Usage {
@@ -133,9 +143,13 @@ private struct SessionsPanelPreview: View {
     let sessions: [SessionRecord]
     let usage: Usage
     var startFormOpen = false
+    var pendingJobs: [Job] = []
+    var cancelledJobs: [Job] = []
 
     var body: some View {
         let state = UIPreview.scratchState()
+        state.activeJobs = pendingJobs
+        state.cancelledJobs = cancelledJobs
         state.settings.vaultPath = "/tmp/preview-vault"
         state.recentSessions = sessions
         state.usage = usage
@@ -143,7 +157,9 @@ private struct SessionsPanelPreview: View {
         model.presetName = "Meeting"
         model.showingStartForm = startFormOpen
         return SessionsPanelView(state: state, model: model,
-                                 onStart: {}, onOpenSettings: {}, onOpenNote: { _ in })
+                                 onStart: {}, onOpenSettings: {}, onOpenNote: { _ in },
+                                 onCancelJob: { _ in }, onRetryJob: { _ in },
+                                 onDiscardJob: { _ in }, onNameSpeakers: { _ in })
             .padding(20)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import MsNotesCore
 
@@ -250,6 +251,179 @@ import Testing
         "Me": "Someone Else",   // R11: ignored
     ])
     #expect(renamed.utterances.map(\.speaker) == ["Me", "Sarah", "Speaker 2", "Speaker 3"])
+}
+
+// MARK: - Cancelling a Job before it costs anything
+
+/// Records what the pipeline actually asked the cloud to do, and can be made
+/// slow enough to cancel mid-flight.
+private final class SpyProvider: STTProvider, @unchecked Sendable {
+    let name = "spy"
+    let delay: Duration
+    private let lock = NSLock()
+    private var _calls = 0
+    var calls: Int { lock.withLock { _calls } }
+    /// Signals that transcription has genuinely started, so a test never
+    /// cancels before the work is under way.
+    let started = AsyncStream<Void>.makeStream()
+
+    init(delay: Duration = .milliseconds(50)) {
+        self.delay = delay
+    }
+
+    func transcribe(track: URL, diarize: Bool, keyTerms: [String]) async throws -> [Utterance] {
+        lock.withLock { _calls += 1 }
+        started.continuation.yield()
+        try await Task.sleep(for: delay)
+        return [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
+    }
+}
+
+/// A real, short CAF written by the app's own TrackWriter, so a Job under test
+/// gets far enough to actually transcode and reach the Provider.
+private func writeTestCAF(at url: URL, seconds: Double = 0.25) throws {
+    let rate = 16_000.0
+    let writer = try TrackWriter(url: url, deviceRate: rate)
+    var samples = [Float](repeating: 0, count: Int(rate * seconds))
+    for i in samples.indices {
+        samples[i] = Float(sin(Double(i) / 8) * 0.4)
+    }
+    samples.withUnsafeMutableBufferPointer { buffer in
+        writer.writeAsync(buffer.baseAddress!, frames: buffer.count)
+    }
+    writer.close()
+}
+
+private func makeQueueEnvironment(provider: STTProvider, root: URL,
+                                  onEvent: @escaping @Sendable (JobQueue.Event) -> Void = { _ in })
+    -> JobQueue.Environment {
+    let defaults = UserDefaults(suiteName: "no.msnotes.test.\(UUID().uuidString)")!
+    let settings = SettingsStore(defaults: defaults)
+    settings.vaultPath = root.appendingPathComponent("vault").path
+    return JobQueue.Environment(
+        provider: provider,
+        summariser: Summariser(apiKey: "unused"),
+        settings: settings,
+        jobsRoot: root.appendingPathComponent("jobs"),
+        transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts")),
+        sessions: SessionIndex(url: root.appendingPathComponent("sessions.json")),
+        onEvent: onEvent)
+}
+
+/// A queued Job that is cancelled before the runner reaches it must never call
+/// the Provider at all. This is the case that actually protects the credits.
+@Test func cancellingAQueuedJobNeverCallsTheProvider() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cancel-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // A provider slow enough that the first Job is still running when the
+    // second is cancelled behind it.
+    let provider = SpyProvider(delay: .seconds(30))
+    let queue = JobQueue(env: makeQueueEnvironment(provider: provider, root: root))
+
+    let first = Session(title: "First", presetName: "Meeting", participants: [],
+                        startedAt: Date(), recordedDuration: 60)
+    let second = Session(title: "Second", presetName: "Meeting", participants: [],
+                         startedAt: Date(), recordedDuration: 60)
+    for session in [first, second] {
+        let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+    await queue.enqueue(session: first, remoteSilent: false)
+    await queue.enqueue(session: second, remoteSilent: false)
+
+    await queue.cancel(id: second.id)
+
+    let cancelled = await queue.cancelledJobs()
+    #expect(cancelled.map(\.id) == [second.id])
+    // Its Recording is kept: cancelling is about spending, not about the audio.
+    #expect(FileManager.default.fileExists(
+        atPath: root.appendingPathComponent("jobs").appendingPathComponent(second.id).path))
+    // And it is no longer counted as work in progress.
+    let active = await queue.activeJobs()
+    #expect(!active.contains { $0.id == second.id })
+
+    await queue.cancel(id: first.id)
+}
+
+@Test func cancellingLeavesTheRecordingUntilDiscardIsAsked() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cancel-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let queue = JobQueue(env: makeQueueEnvironment(
+        provider: SpyProvider(delay: .seconds(30)), root: root))
+    let session = Session(title: "Mistake", presetName: "Meeting", participants: [],
+                          startedAt: Date(), recordedDuration: 60)
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try Data("audio".utf8).write(to: dir.appendingPathComponent("mic.caf"))
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    await queue.cancel(id: session.id)
+    #expect(FileManager.default.fileExists(atPath: dir.path))
+
+    // A cancelled Job can be sent through after all.
+    await queue.retry(id: session.id)
+    #expect(await queue.cancelledJobs().isEmpty)
+    await queue.cancel(id: session.id)
+
+    // Discard is what actually deletes the audio.
+    await queue.discard(id: session.id)
+    #expect(!FileManager.default.fileExists(atPath: dir.path))
+    #expect(await queue.allJobs().isEmpty)
+}
+
+@Test func cancellingIsNotAFailure() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cancel-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let events = Mutex<[String]>([])
+    let provider = SpyProvider(delay: .seconds(30))
+    let queue = JobQueue(env: makeQueueEnvironment(
+        provider: provider, root: root,
+        onEvent: { event in
+            switch event {
+            case .jobFailed: events.withLock { $0.append("failed") }
+            case .jobCancelled: events.withLock { $0.append("cancelled") }
+            default: break
+            }
+        }))
+    let session = Session(title: "Mistake", presetName: "Meeting", participants: [],
+                          startedAt: Date(), recordedDuration: 60)
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    // Real audio, so transcoding runs and the Provider is genuinely reached.
+    for track in ["mic.caf", "remote.caf"] {
+        try writeTestCAF(at: dir.appendingPathComponent(track))
+    }
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    // Cancel only once the upload is genuinely under way, so this exercises
+    // tearing down an in-flight request rather than skipping a queued Job.
+    var iterator = provider.started.stream.makeAsyncIterator()
+    _ = await iterator.next()
+    await queue.cancel(id: session.id)
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(provider.calls > 0)
+
+    // The torn-down request must not surface as something going wrong.
+    #expect(events.withLock { $0 } == ["cancelled"])
+    #expect(await queue.failedJobs().isEmpty)
+}
+
+@Test func cancellationIsClassifiedAsCancellationNotFailure() {
+    let urlCancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+    let classified = PipelineError.classify(transport: urlCancelled, context: "assemblyai")
+    #expect(classified.isCancellation)
+    #expect(!classified.isTransient)   // must never auto-retry
+
+    #expect(PipelineError.classify(transport: CancellationError(), context: "x").isCancellation)
+    // A genuine network failure is still transient.
+    let offline = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+    #expect(!PipelineError.classify(transport: offline, context: "x").isCancellation)
 }
 
 // MARK: - Auto-end detection

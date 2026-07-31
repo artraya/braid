@@ -17,6 +17,10 @@ final class AppState {
     var phase: Phase = .idle { didSet { onChange?() } }
     var processingCount = 0 { didSet { onChange?() } }
     var failedJobs: [MsNotesCore.Job] = [] { didSet { onChange?() } }
+    /// In flight or waiting, so they can be cancelled before they cost anything.
+    var activeJobs: [MsNotesCore.Job] = [] { didSet { onChange?() } }
+    /// Cancelled but still holding their Recording, awaiting process or delete.
+    var cancelledJobs: [MsNotesCore.Job] = [] { didSet { onChange?() } }
     var lastError: String? { didSet { onChange?() } }
     var currentTitle = ""
     var recordingStartedAt: Date?
@@ -127,6 +131,8 @@ final class AppState {
         case .remoteSilentWarning:
             Notifier.notify(title: "No system audio captured",
                             body: "Check the System Audio Recording permission. The note will only contain your side.")
+        case .jobCancelled:
+            break   // the user just asked for this; a notification would be noise
         case .speakersDetected(let job, let stats):
             refreshNamingState()
             let count = stats.count
@@ -141,6 +147,27 @@ final class AppState {
         guard let queue else { return }
         processingCount = await queue.pendingCount()
         failedJobs = await queue.failedJobs()
+        activeJobs = await queue.activeJobs()
+        cancelledJobs = await queue.cancelledJobs()
+    }
+
+    /// Stops a Job before it spends anything more. The Recording is kept, so
+    /// the choice is only about money, never about losing audio.
+    func cancelJob(id: String) {
+        let queue = self.queue
+        Task {
+            await queue?.cancel(id: id)
+            await self.refreshJobState()
+        }
+    }
+
+    /// Deletes a cancelled Job's Recording. Callers confirm first.
+    func discardJob(id: String) {
+        let queue = self.queue
+        Task {
+            await queue?.discard(id: id)
+            await self.refreshJobState()
+        }
     }
 
     func refreshNamingState() {

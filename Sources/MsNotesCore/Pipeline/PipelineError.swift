@@ -7,9 +7,17 @@ import Foundation
 public enum PipelineError: Error, CustomStringConvertible, Sendable {
     case transient(String)
     case permanent(String)
+    /// The user cancelled the Job. Not a failure: it must not retry, must not
+    /// park as `.failed`, and must not be reported as something going wrong.
+    case cancelled
 
     public var isTransient: Bool {
         if case .transient = self { return true }
+        return false
+    }
+
+    public var isCancellation: Bool {
+        if case .cancelled = self { return true }
         return false
     }
 
@@ -17,6 +25,7 @@ public enum PipelineError: Error, CustomStringConvertible, Sendable {
         switch self {
         case .transient(let m): "transient: \(m)"
         case .permanent(let m): "\(m)"
+        case .cancelled: "cancelled"
         }
     }
 
@@ -30,8 +39,11 @@ public enum PipelineError: Error, CustomStringConvertible, Sendable {
 
     /// Classify a URLSession transport error (no HTTP response at all).
     static func classify(transport error: Error, context: String) -> PipelineError {
+        if error is CancellationError { return .cancelled }
         let ns = error as NSError
         if ns.domain == NSURLErrorDomain {
+            // An in-flight request torn down because the user cancelled the Job.
+            if ns.code == NSURLErrorCancelled { return .cancelled }
             switch ns.code {
             case NSURLErrorTimedOut, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
                  NSURLErrorNetworkConnectionLost, NSURLErrorDNSLookupFailed,

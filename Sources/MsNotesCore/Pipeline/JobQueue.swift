@@ -8,6 +8,7 @@ public struct Job: Sendable, Codable, Identifiable {
         case queued          // waiting to run (or retry after transient failure)
         case running
         case failed          // non-transient; waits for user-initiated Retry (R7)
+        case cancelled       // user stopped it before the cloud was paid for
         case done
     }
 
@@ -76,12 +77,16 @@ public actor JobQueue {
         /// The Note is already written; these are the Remote speakers the user
         /// may want to put names to.
         case speakersDetected(Job, [Transcript.SpeakerStat])
+        case jobCancelled(Job)
     }
 
     let log = Logger(subsystem: "no.msnotes.app", category: "pipeline")
     var env: Environment
     var jobs: [String: Job] = [:]
     var runnerActive = false
+    /// The Job currently in flight, held so it can be cancelled mid-upload.
+    var currentJobID: String?
+    var currentTask: Task<URL, Error>?
 
     public init(env: Environment) {
         self.env = env
@@ -126,9 +131,9 @@ public actor JobQueue {
         kickRunner()
     }
 
-    /// User-initiated Retry for a `.failed` Job (R7).
+    /// User-initiated Retry for a `.failed` or `.cancelled` Job (R7).
     public func retry(id: String) {
-        guard var job = jobs[id], job.status == .failed else { return }
+        guard var job = jobs[id], job.status == .failed || job.status == .cancelled else { return }
         job.status = .queued
         job.lastError = nil
         jobs[id] = job
@@ -136,11 +141,53 @@ public actor JobQueue {
         kickRunner()
     }
 
+    /// Stops a Job before it costs anything more, and keeps its Recording.
+    ///
+    /// The point is money: a Session started by mistake would otherwise upload
+    /// two Tracks and pay for a summary with no one wanting the note. Cancelling
+    /// mid-flight tears down the in-flight request, so whatever has not been
+    /// billed yet never is. Anything already billed stays billed — the upload
+    /// cannot be unsent.
+    ///
+    /// The Recording is deliberately kept. Cancelling is a decision about
+    /// spending, not about throwing audio away, and R7's rule that only a
+    /// confirmed-success Job may delete a Recording still holds. `discard`
+    /// deletes it, once the user says so.
+    public func cancel(id: String) {
+        guard var job = jobs[id], job.status == .queued || job.status == .running else { return }
+        if currentJobID == id {
+            currentTask?.cancel()
+        }
+        job.status = .cancelled
+        job.lastError = nil
+        jobs[id] = job
+        persist(job)
+        log.notice("job \(id, privacy: .public) cancelled by user")
+        env.onEvent(.jobCancelled(job))
+    }
+
+    /// Deletes a cancelled or failed Job's Recording and forgets it. The only
+    /// path in the app that destroys audio no Note was written from, so callers
+    /// confirm first.
+    public func discard(id: String) {
+        guard let job = jobs[id], job.status != .running else { return }
+        try? FileManager.default.removeItem(at: env.jobsRoot.appendingPathComponent(id))
+        try? FileManager.default.removeItem(
+            at: env.jobsRoot.appendingPathComponent("\(id).json"))
+        jobs[id] = nil
+        log.notice("job \(job.id, privacy: .public) discarded, recording deleted")
+    }
+
     public func allJobs() -> [Job] { Array(jobs.values) }
     public func failedJobs() -> [Job] { jobs.values.filter { $0.status == .failed } }
-    public func pendingCount() -> Int {
-        jobs.values.filter { $0.status == .queued || $0.status == .running }.count
+    public func cancelledJobs() -> [Job] { jobs.values.filter { $0.status == .cancelled } }
+    /// Jobs in flight or waiting, newest first, so the panel can offer Cancel.
+    public func activeJobs() -> [Job] {
+        jobs.values
+            .filter { $0.status == .queued || $0.status == .running }
+            .sorted { $0.session.startedAt > $1.session.startedAt }
     }
+    public func pendingCount() -> Int { activeJobs().count }
 
     // MARK: - Runner
 
@@ -166,8 +213,15 @@ public actor JobQueue {
         env.onEvent(.jobStarted(job))
         log.notice("job \(jobID, privacy: .public) started (attempt \(job.attempts))")
 
+        // Run in a child Task so `cancel` can tear it down mid-flight: while
+        // this awaits, the actor stays free to take that call.
+        let task = Task { try await self.execute(job) }
+        currentJobID = jobID
+        currentTask = task
+        defer { currentJobID = nil; currentTask = nil }
+
         do {
-            let noteURL = try await execute(job)
+            let noteURL = try await task.value
             job.status = .done
             job.noteURL = noteURL.path
             job.lastError = nil
@@ -176,7 +230,16 @@ public actor JobQueue {
             env.onEvent(.jobDone(job, noteURL: noteURL))
             log.notice("job \(jobID, privacy: .public) done -> \(noteURL.lastPathComponent, privacy: .public)")
         } catch {
-            let pipelineError = error as? PipelineError ?? .permanent("\(error)")
+            let pipelineError = error as? PipelineError
+                ?? (error is CancellationError ? .cancelled : .permanent("\(error)"))
+
+            // `cancel` has already set the status and told the UI. Anything the
+            // torn-down request threw on the way out is noise, not a failure.
+            if pipelineError.isCancellation || jobs[jobID]?.status == .cancelled {
+                log.notice("job \(jobID, privacy: .public) stopped after cancellation")
+                return
+            }
+
             job.lastError = pipelineError.description
             if pipelineError.isTransient {
                 job.status = .queued
@@ -206,9 +269,16 @@ public actor JobQueue {
             throw PipelineError.permanent("no Vault path configured")
         }
 
+        // Cancellation is checked before each expensive or billable step.
+        // Transcoding an hour of audio is slow, and everything after it costs
+        // money, so a cancel landing here must not push on regardless.
+        try checkCancelled()
+
         // Transcode to FLAC for upload (kept beside the CAF originals).
         let micFLAC = try Transcoder.toFLAC(micCAF)
         let remoteFLAC = try Transcoder.toFLAC(remoteCAF)
+
+        try checkCancelled()
 
         // R6: the Mic Track has exactly one speaker, so it goes without
         // diarization and is labelled "Me". The Remote Track is diarized with
@@ -225,6 +295,9 @@ public actor JobQueue {
         let transcript = mergeTranscripts(
             mic: micUtterances, remote: remoteUtterances,
             pauseSpans: job.session.pauseSpans)
+
+        // Transcription is paid for by now; the summary is not.
+        try checkCancelled()
 
         guard let preset = env.settings.presets.first(where: { $0.name == job.session.presetName })
                 ?? env.settings.presets.first else {
@@ -280,6 +353,12 @@ public actor JobQueue {
         // Only a confirmed-success Job may delete a Recording (Operation).
         try? fm.removeItem(at: dir)
         return written.noteURL
+    }
+
+    /// Throws `.cancelled` if the user has stopped this Job. Used at the points
+    /// where continuing would cost money or a lot of time.
+    nonisolated func checkCancelled() throws {
+        if Task.isCancelled { throw PipelineError.cancelled }
     }
 
     // MARK: - Persistence

@@ -25,6 +25,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.action = #selector(statusItemClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         sessionsPanel.onOpenSettings = { [weak self] in self?.settingsTapped() }
+        sessionsPanel.onNameSpeakers = { [weak self] id in self?.showNaming(sessionID: id) }
         state.onChange = { [weak self] in
             self?.refreshIcon()
             self?.recordingHUD.syncToPhase()
@@ -99,12 +100,27 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(stop)
         }
 
-        if state.processingCount > 0 {
+        if !state.activeJobs.isEmpty {
             menu.addItem(.separator())
-            let item = NSMenuItem(title: "Processing \(state.processingCount) job(s)…",
-                                  action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
+            for job in state.activeJobs {
+                let item = NSMenuItem(title: "Cancel processing — \(job.session.title)",
+                                      action: #selector(cancelJobTapped(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = job.id
+                item.toolTip = "Stops before it costs anything more. The recording is kept."
+                menu.addItem(item)
+            }
+        }
+
+        if !state.cancelledJobs.isEmpty {
+            menu.addItem(.separator())
+            for job in state.cancelledJobs {
+                let item = NSMenuItem(title: "Process \(job.session.title) after all",
+                                      action: #selector(retryTapped(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = job.id
+                menu.addItem(item)
+            }
         }
 
         if !state.awaitingNames.isEmpty {
@@ -164,9 +180,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc func quitTapped() { NSApp.terminate(nil) }
 
     @objc func nameSpeakersTapped(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let record = state.awaitingNames.first(where: { $0.id == id }) else { return }
+        if let id = sender.representedObject as? String { showNaming(sessionID: id) }
+    }
+
+    func showNaming(sessionID: String) {
+        guard let record = state.awaitingNames.first(where: { $0.id == sessionID }) else { return }
         namingWindow.show(record: record)
+    }
+
+    @objc func cancelJobTapped(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String {
+            state.cancelJob(id: id)
+        }
     }
 
     @objc func retryTapped(_ sender: NSMenuItem) {

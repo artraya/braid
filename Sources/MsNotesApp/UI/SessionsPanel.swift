@@ -29,6 +29,7 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     /// Set by StatusItemController so Settings and Quit stay reachable from the
     /// panel as well as the right-click menu.
     var onOpenSettings: (() -> Void)?
+    var onNameSpeakers: ((String) -> Void)?
 
     init(state: AppState) {
         self.state = state
@@ -70,8 +71,31 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
                 self?.close()
                 self?.onOpenSettings?()
             },
-            onOpenNote: { [weak self] path in self?.state.openNote(at: path) }))
+            onOpenNote: { [weak self] path in self?.state.openNote(at: path) },
+            onCancelJob: { [weak self] id in self?.state.cancelJob(id: id) },
+            onRetryJob: { [weak self] id in self?.state.retry(jobID: id) },
+            onDiscardJob: { [weak self] id in self?.confirmDiscard(id) },
+            onNameSpeakers: { [weak self] id in
+                self?.close()
+                self?.onNameSpeakers?(id)
+            }))
         return panel
+    }
+
+    /// Deleting a Recording that produced no Note is the one irreversible thing
+    /// in this panel, so it asks, and the default answer keeps the audio.
+    private func confirmDiscard(_ id: String) {
+        guard let job = state.cancelledJobs.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete the recording for \"\(job.session.title)\"?"
+        alert.informativeText =
+            "\(Format.duration(job.session.recordedDuration)) of audio is deleted and no note is written. This cannot be undone."
+        alert.addButton(withTitle: "Keep it")
+        alert.addButton(withTitle: "Delete")
+        if alert.runModal() == .alertSecondButtonReturn {
+            state.discardJob(id: id)
+        }
     }
 
     private func start() {
@@ -94,11 +118,16 @@ struct SessionsPanelView: View {
     let onStart: () -> Void
     let onOpenSettings: () -> Void
     let onOpenNote: (String) -> Void
+    let onCancelJob: (String) -> Void
+    let onRetryJob: (String) -> Void
+    let onDiscardJob: (String) -> Void
+    let onNameSpeakers: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
             UsageCard(usage: state.usage)
+            processingList
             sessionList
             if model.showingStartForm {
                 StartForm(state: state, model: model, onStart: onStart)
@@ -124,6 +153,42 @@ struct SessionsPanelView: View {
             }
             .buttonStyle(.plain)
             .help("Settings")
+        }
+    }
+
+    /// Work that has not been paid for yet, with the way to stop it. This sits
+    /// above the history because it is the only part of the panel that is
+    /// time-sensitive: once a Job finishes, cancelling it is no longer an option.
+    @ViewBuilder
+    private var processingList: some View {
+        if !state.activeJobs.isEmpty || !state.cancelledJobs.isEmpty {
+            VStack(spacing: 6) {
+                ForEach(state.activeJobs) { job in
+                    PendingRow(title: job.session.title,
+                               detail: "Processing · \(Format.duration(job.session.recordedDuration))",
+                               tint: Theme.accent, spinning: true) {
+                        PendingAction(label: "Cancel", tint: Theme.dim) { onCancelJob(job.id) }
+                    }
+                }
+                ForEach(state.cancelledJobs) { job in
+                    PendingRow(title: job.session.title,
+                               detail: "Cancelled · \(Format.duration(job.session.recordedDuration)) kept",
+                               tint: Theme.faint, spinning: false) {
+                        PendingAction(label: "Process", tint: Theme.accent) { onRetryJob(job.id) }
+                        PendingAction(label: "Delete", tint: Theme.recording) { onDiscardJob(job.id) }
+                    }
+                }
+                // Also in the right-click menu, but the panel is where people
+                // look, and a prompt only reachable from a menu gets missed.
+                ForEach(state.awaitingNames) { record in
+                    let count = record.transcript.remoteSpeakerStats().count
+                    PendingRow(title: record.session.title,
+                               detail: "\(count) speaker\(count == 1 ? "" : "s") to name",
+                               tint: Theme.accent, spinning: false, symbol: "person.wave.2") {
+                        PendingAction(label: "Name", tint: Theme.accent) { onNameSpeakers(record.id) }
+                    }
+                }
+            }
         }
     }
 
@@ -220,6 +285,55 @@ private struct UsageCard: View {
         .overlay(
             RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous)
                 .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1))
+    }
+}
+
+private struct PendingAction: View {
+    let label: String
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(label, action: action)
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(tint)
+    }
+}
+
+private struct PendingRow<Actions: View>: View {
+    let title: String
+    let detail: String
+    let tint: Color
+    let spinning: Bool
+    var symbol = "pause.circle"
+    @ViewBuilder let actions: () -> Actions
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Group {
+                if spinning {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                } else {
+                    Image(systemName: symbol).font(.system(size: 14))
+                }
+            }
+            .foregroundStyle(tint)
+            .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Text(detail).font(.system(size: 11)).foregroundStyle(Theme.faint)
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 10) { actions() }
+        }
+        .padding(10)
+        .background(Theme.cardRaised,
+                    in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
     }
 }
 
