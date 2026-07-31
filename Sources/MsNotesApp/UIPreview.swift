@@ -25,16 +25,17 @@ enum UIPreview {
         let panel = previewWindow(
             title: "Sessions panel",
             view: SessionsPanelPreview(sessions: previewSessions, usage: previewUsage),
-            size: NSSize(width: Theme.panelWidth + 40, height: 560))
-        let hud = previewWindow(
-            title: "Recording HUD",
-            view: RecordingHUDPreview(),
-            size: NSSize(width: 400, height: 290))
+            size: NSSize(width: Theme.panelWidth + 40, height: 620))
+        let recording = previewWindow(
+            title: "Recording",
+            view: SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                       recording: .recording),
+            size: NSSize(width: Theme.panelWidth + 40, height: 780))
 
         // Side by side on screen.
         if let visible = NSScreen.main?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x: visible.midX - 440, y: visible.midY - 280))
-            hud.setFrameOrigin(NSPoint(x: visible.midX + 30, y: visible.midY - 140))
+            panel.setFrameOrigin(NSPoint(x: visible.midX - 460, y: visible.midY - 310))
+            recording.setFrameOrigin(NSPoint(x: visible.midX + 40, y: visible.midY - 390))
         }
         app.activate(ignoringOtherApps: true)
         app.run()
@@ -56,11 +57,21 @@ enum UIPreview {
         }
 
         let placeholderHeight: CGFloat = 480
-        for (name, sessions) in [("populated", previewSessions), ("empty", [SessionRecord]())] {
+        // Every view the panel can show, because each is a different height and
+        // the window has to hang flush from the menu bar in all of them.
+        let cases: [(String, SessionsPanelPreview)] = [
+            ("populated", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage)),
+            ("empty", SessionsPanelPreview(sessions: [], usage: previewUsage)),
+            ("recording", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                               recording: .recording)),
+            ("settings", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                              route: .settings)),
+        ]
+        for (name, preview) in cases {
             let panel = FloatingPanel(
                 contentRect: NSRect(x: 0, y: 0, width: Theme.panelWidth, height: placeholderHeight),
                 draggable: false)
-            panel.setContent(SessionsPanelPreview(sessions: sessions, usage: previewUsage))
+            panel.setContent(preview)
             panel.layoutIfNeeded()
             panel.fitToContent()
 
@@ -109,9 +120,30 @@ enum UIPreview {
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    arrowX: Theme.panelWidth - 34),
               named: "panel-arrow-right", into: directory)
-        write(RecordingHUDPreview(), named: "hud", into: directory)
-        write(RecordingHUDPreview(paused: true), named: "hud-paused", into: directory)
-        write(RecordingHUDPreview(autoEndIn: 24), named: "hud-auto-end", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   recording: .recording),
+              named: "panel-recording", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   recording: .paused),
+              named: "panel-recording-paused", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   recording: .recording, autoEndIn: 24),
+              named: "panel-recording-auto-end", into: directory)
+        write(SessionsPanelPreview(
+                sessions: previewSessions, usage: previewUsage, recording: .recording,
+                confirmation: .init(action: .discardRecording,
+                                    question: "Discard this recording?",
+                                    detail: "The audio is deleted and no note is written. This cannot be undone.",
+                                    confirmLabel: "Discard")),
+              named: "panel-confirm", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   route: .settings),
+              named: "panel-settings", into: directory)
+        if let naming = previewNamingRecord {
+            write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                       route: .naming(naming.id), awaitingNames: [naming]),
+                  named: "panel-naming", into: directory)
+        }
     }
 
     private static func write(_ view: some View, named name: String, into directory: URL) {
@@ -144,6 +176,23 @@ enum UIPreview {
             sample("Book chapter dictation", minutesAgo: 60 * 52, duration: 3063, cost: 3.02),
             sample("Site handover", minutesAgo: 60 * 120, duration: 640, cost: 0.72),
         ]
+    }
+
+    private static var previewNamingRecord: NamingRecord? {
+        let session = Session(title: "Client call — Acme", presetName: "Meeting",
+                              participants: ["Sarah", "Tom"], startedAt: Date(),
+                              recordedDuration: 1720)
+        let transcript = Transcript(utterances: [
+            Utterance(speaker: "Me", start: 0, end: 20, text: "Thanks for making the time."),
+            Utterance(speaker: "Speaker 1", start: 20, end: 96,
+                      text: "We looked at the slope data over the weekend and the movement rates have settled right down."),
+            Utterance(speaker: "Speaker 2", start: 96, end: 130,
+                      text: "Agreed, though I would like another week before we sign it off."),
+            Utterance(speaker: "Speaker 1", start: 130, end: 150, text: "Fine by me."),
+        ])
+        return NamingRecord(session: session, transcript: transcript, provider: "assemblyai",
+                            costUSD: 1.94, notePath: "/tmp/note.md",
+                            transcriptPath: "/tmp/transcript.md", noteHash: "")
     }
 
     private static func previewJob(_ title: String, minutes: Double) -> Job {
@@ -202,50 +251,44 @@ private struct SessionsPanelPreview: View {
     var pendingJobs: [Job] = []
     var cancelledJobs: [Job] = []
     var arrowX: CGFloat?
+    /// Drives the recording block at the top of the panel.
+    var recording: AppState.Phase = .idle
+    var autoEndIn: Int?
+    var confirmation: SessionsPanelModel.Confirmation?
+    var route: SessionsPanelModel.Route = .main
+    var awaitingNames: [NamingRecord] = []
 
     var body: some View {
         let state = UIPreview.scratchState()
         state.activeJobs = pendingJobs
         state.cancelledJobs = cancelledJobs
+        state.awaitingNames = awaitingNames
         state.settings.vaultPath = "/tmp/preview-vault"
         state.recentSessions = sessions
         state.usage = usage
+        state.phase = recording
+        if recording != .idle {
+            state.currentTitle = "Another Test"
+            state.recordingStartedAt = Date().addingTimeInterval(-736)
+        }
         let model = SessionsPanelModel()
         model.presetName = "Meeting"
         model.showingStartForm = startFormOpen
         model.arrowX = arrowX ?? Theme.panelWidth / 2
-        return SessionsPanelView(state: state, model: model,
-                                 onStart: {}, onOpenSettings: {}, onOpenNote: { _ in },
-                                 onCancelJob: { _ in }, onRetryJob: { _ in },
-                                 onDiscardJob: { _ in }, onNameSpeakers: { _ in })
-            .padding(20)
-    }
-}
-
-@MainActor
-private struct RecordingHUDPreview: View {
-    var paused = false
-    var autoEndIn: Int?
-
-    var body: some View {
-        let state = AppState()
-        state.phase = paused ? .paused : .recording
-        state.currentTitle = "Another Test"
-        state.recordingStartedAt = Date().addingTimeInterval(-736)
-        let model = RecordingHUDModel()
+        model.route = route
+        model.confirmation = confirmation
         model.elapsed = 736
         model.costEstimate = 0.11
         model.autoEndIn = autoEndIn
+        model.settingsForm.load(from: state)
         // A plausible speech envelope rather than noise, so the bar scaling can
         // actually be judged.
-        model.levels = (0..<RecordingHUDController.barCount).map { i in
+        model.levels = (0..<SessionsPanelController.barCount).map { i in
             let phrase = sin(Double(i) / 3.1) * 0.5 + 0.5
             let breath = sin(Double(i) / 11.0) * 0.35 + 0.6
             return Float(max(0.04, phrase * breath * 0.8))
         }
-        return RecordingHUDView(state: state, model: model,
-                                onPauseResume: {}, onStop: {}, onDiscard: {},
-                                onKeepRecording: {})
+        return SessionsPanelView(state: state, model: model)
             .padding(20)
     }
 }

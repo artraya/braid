@@ -65,13 +65,16 @@ brand new app and forgets your permissions.
 
 ## Using it
 
-Left click the menu bar icon for the **Sessions panel**: this month's minutes
-against a budget you set, what it has cost, and your recent sessions, each
-opening its note in Obsidian. Record expands the panel into the start form.
-Right click gives a plain menu for settings, retries and speaker naming.
+Left click the menu bar icon for the **panel**, which hangs off the icon and
+points at it. That panel is the whole app. It shows this month's minutes against
+a budget you set, what it has cost, and your recent sessions, each opening its
+note in Obsidian. Record expands it into the start form.
 
-While recording, a small **HUD** floats on screen with the clock, a live
-waveform, pause, stop and discard. Drag it wherever suits.
+While recording, the same panel gains a block at the top with the clock, a live
+waveform, pause, stop and discard. Click the icon to tuck it away and the
+recording carries on; click again to bring it back. Naming speakers, settings
+and every confirmation happen in there too, so the app never opens a second
+window. Right click the icon for a short menu of shortcuts.
 
 Pick a **preset** when you start recording: Meeting, Lecture, Interview or
 Training. Each one is a prompt template that shapes the note, and all four are
