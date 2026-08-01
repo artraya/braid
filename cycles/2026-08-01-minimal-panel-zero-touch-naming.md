@@ -1,5 +1,5 @@
 # Minimal panel, zero-touch naming
-status: verified
+status: shipped
 created: 2026-08-01
 updated: 2026-08-01
 release: production
@@ -136,6 +136,12 @@ README screenshots now two cycles stale.
 **Limitations within contract**: an auto-assigned wrong name (stand-in) is
 fixable in Obsidian; the naming record remains for correction but no UI path
 reopens it — Obsidian is the editor, per the one-window posture.
+
+## Release
+
+Shipped 2026-08-01 as v0.4.0 (`e030694`). Owner ran build + install; smoke
+check: installed binary hash matches the signed build (`f50aca0e…`), app
+relaunched from /Applications and stable. Rollback: `~/Braid-v0.3.0-rollback.zip`.
 
 ## Learning and next move
 
