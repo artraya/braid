@@ -43,7 +43,7 @@ public actor JobQueue {
 
     public struct Environment: Sendable {
         public var provider: STTProvider
-        public var summariser: Summariser
+        public var summariser: any NoteSummarising
         public var settings: SettingsStore
         public var costTable: CostTable
         public var jobsRoot: URL
@@ -52,7 +52,7 @@ public actor JobQueue {
         /// Called on status changes so the UI can react (icon state, notifications).
         public var onEvent: @Sendable (Event) -> Void
 
-        public init(provider: STTProvider, summariser: Summariser, settings: SettingsStore,
+        public init(provider: STTProvider, summariser: any NoteSummarising, settings: SettingsStore,
                     costTable: CostTable = .current,
                     jobsRoot: URL = JobQueue.appSupportURL.appendingPathComponent("jobs"),
                     transcripts: TranscriptStore = TranscriptStore(),
@@ -75,8 +75,8 @@ public actor JobQueue {
         case jobFailed(Job, transient: Bool)
         case remoteSilentWarning(Job)
         /// The Note is already written; these are the Remote speakers the user
-        /// may want to put names to.
-        case speakersDetected(Job, [Transcript.SpeakerStat])
+        /// may want to put names to, and any heard-vs-expected disagreement.
+        case speakersDetected(Job, [Transcript.SpeakerStat], Session.SpeakerCountMismatch?)
         case jobCancelled(Job)
     }
 
@@ -280,16 +280,19 @@ public actor JobQueue {
 
         try checkCancelled()
 
-        // R6: the Mic Track has exactly one speaker, so it goes without
-        // diarization and is labelled "Me". The Remote Track is diarized with
-        // no speaker count at all — Participants must not cap it (see
-        // AssemblyAIAdapter.requestBody).
-        let keyTerms = env.settings.keyTerms
+        // R6 (amended): the Mic Track has exactly one speaker, so it goes
+        // without diarization and is labelled "Me". The Remote Track is
+        // diarized; a speaker count rides along only when the user asserted
+        // one at Start — never derived from Participants (see
+        // AssemblyAIAdapter.requestBody). Participants do join the Key Terms,
+        // so the names R11 needs as evidence arrive spelled correctly.
+        let keyTerms = job.session.mergedKeyTerms(global: env.settings.keyTerms)
 
         async let micTask = env.provider.transcribe(
-            track: micFLAC, diarize: false, keyTerms: keyTerms)
+            track: micFLAC, diarize: false, keyTerms: keyTerms, expectedSpeakers: nil)
         async let remoteTask = env.provider.transcribe(
-            track: remoteFLAC, diarize: true, keyTerms: keyTerms)
+            track: remoteFLAC, diarize: true, keyTerms: keyTerms,
+            expectedSpeakers: job.session.expectedSpeakers)
         let (micUtterances, remoteUtterances) = try await (micTask, remoteTask)
 
         let transcript = mergeTranscripts(
@@ -338,16 +341,23 @@ public actor JobQueue {
                                        notePath: written.noteURL.path))
 
         // Keep the structured Transcript so speakers can be named later. The
-        // Vault only holds markdown, and the Recording is about to go.
+        // Vault only holds markdown, and the Recording is about to go. Any
+        // heard-vs-expected mismatch is computed here, after delivery, so it
+        // can only ever inform — never block (Journey step 7 stays hands-off).
         let stats = transcript.remoteSpeakerStats()
         if !stats.isEmpty {
+            let mismatch = job.session.speakerMismatch(heardRemoteSpeakers: stats.count)
+            if let mismatch {
+                log.warning("speaker mismatch for \(job.id, privacy: .public): \(mismatch.message, privacy: .public)")
+            }
             let noteContents = (try? String(contentsOf: written.noteURL, encoding: .utf8)) ?? ""
             env.transcripts.save(NamingRecord(
                 session: job.session, transcript: transcript, provider: env.provider.name,
                 costUSD: cost, notePath: written.noteURL.path,
                 transcriptPath: written.transcriptURL.path,
-                noteHash: NamingRecord.hash(noteContents)))
-            env.onEvent(.speakersDetected(job, stats))
+                noteHash: NamingRecord.hash(noteContents),
+                speakerMismatch: mismatch))
+            env.onEvent(.speakersDetected(job, stats, mismatch))
         }
 
         // Only a confirmed-success Job may delete a Recording (Operation).

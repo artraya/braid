@@ -6,8 +6,10 @@ public protocol STTProvider: Sendable {
     var name: String { get }
     /// Transcribes one Track. `diarize: false` returns a single unlabelled
     /// speaker stream (the Adapter's caller labels the Mic Track "Me").
-    /// Diarization never takes a speaker count: see `requestBody`.
-    func transcribe(track: URL, diarize: Bool, keyTerms: [String]) async throws -> [Utterance]
+    /// `expectedSpeakers` is honoured only when diarizing, and only because the
+    /// user asserted it at Start (amended R6): see `requestBody`.
+    func transcribe(track: URL, diarize: Bool, keyTerms: [String],
+                    expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance]
 }
 
 /// AssemblyAI universal-3-5-pro (SPEC Architecture). Quirks owned here:
@@ -25,10 +27,11 @@ public struct AssemblyAIAdapter: STTProvider {
         self.baseURL = baseURL
     }
 
-    public func transcribe(track: URL, diarize: Bool,
-                           keyTerms: [String]) async throws -> [Utterance] {
+    public func transcribe(track: URL, diarize: Bool, keyTerms: [String],
+                           expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance] {
         let uploadURL = try await upload(track)
-        let id = try await submit(audioURL: uploadURL, diarize: diarize, keyTerms: keyTerms)
+        let id = try await submit(audioURL: uploadURL, diarize: diarize, keyTerms: keyTerms,
+                                  expectedSpeakers: expectedSpeakers)
         return try await poll(id: id)
     }
 
@@ -50,13 +53,17 @@ public struct AssemblyAIAdapter: STTProvider {
     /// The exact submission body. Split out so R6 can be verified against the
     /// real code rather than a reimplementation of it.
     ///
-    /// `speaker_options` is deliberately never sent. An earlier version capped
-    /// the Remote Track at Participants+1 speakers, which meant anyone who
+    /// Speaker counts (amended R6): by default no request carries one. An
+    /// earlier version derived a cap from Participants, which meant anyone who
     /// joined a call late was folded into an existing speaker and their words
-    /// attributed to the wrong person. Participants are Summariser hints and
-    /// naming suggestions only; the Provider decides how many voices it hears.
-    public static func requestBody(audioURL: String, diarize: Bool,
-                                   keyTerms: [String]) -> [String: Any] {
+    /// attributed to the wrong person — a constraint may only ever come from
+    /// the user asserting it at Start. Even then `count` is sent as a minimum
+    /// (fixes two voices heard as one, cannot fold a late joiner); only
+    /// `strict` adds the maximum. The undiarized Mic request never carries
+    /// speaker fields at all.
+    public static func requestBody(audioURL: String, diarize: Bool, keyTerms: [String],
+                                   expectedSpeakers: Session.SpeakerExpectation? = nil)
+        -> [String: Any] {
         var body: [String: Any] = [
             "audio_url": audioURL,
             "speech_models": ["universal-3-5-pro"],
@@ -66,11 +73,20 @@ public struct AssemblyAIAdapter: STTProvider {
         if !keyTerms.isEmpty {
             body["keyterms_prompt"] = keyTerms
         }
+        if diarize, let expected = expectedSpeakers {
+            var options: [String: Any] = ["min_speakers_expected": expected.count]
+            if expected.strict {
+                options["max_speakers_expected"] = expected.count
+            }
+            body["speaker_options"] = options
+        }
         return body
     }
 
-    func submit(audioURL: String, diarize: Bool, keyTerms: [String]) async throws -> String {
-        let body = Self.requestBody(audioURL: audioURL, diarize: diarize, keyTerms: keyTerms)
+    func submit(audioURL: String, diarize: Bool, keyTerms: [String],
+                expectedSpeakers: Session.SpeakerExpectation?) async throws -> String {
+        let body = Self.requestBody(audioURL: audioURL, diarize: diarize, keyTerms: keyTerms,
+                                    expectedSpeakers: expectedSpeakers)
         var request = URLRequest(url: baseURL.appendingPathComponent("v2/transcript"))
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "authorization")

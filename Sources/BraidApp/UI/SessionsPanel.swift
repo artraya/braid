@@ -24,6 +24,9 @@ final class SessionsPanelModel {
     var title = ""
     var participants = ""
     var presetName = ""
+    /// nil = Auto: the Provider decides how many voices it hears (amended R6).
+    var speakerCount: Int?
+    var speakersStrict = false
     /// Where the pointer sits, measured from the panel's left edge. Updated
     /// whenever the panel is placed, since it is clamped to the screen while
     /// the menu bar icon is not.
@@ -62,6 +65,8 @@ final class SessionsPanelModel {
         title = ""
         participants = ""
         presetName = defaultPreset
+        speakerCount = nil
+        speakersStrict = false
         showingStartForm = false
     }
 
@@ -71,6 +76,15 @@ final class SessionsPanelModel {
         namingNames = [:]
         namingError = nil
         namingWorking = false
+    }
+
+    /// Pre-fills the one safe case: one voice, one Participant. The user still
+    /// presses Apply — nothing is assigned unasked (R6a) — but the common
+    /// one-on-one call needs no typing.
+    func prefillNaming(_ record: NamingRecord) {
+        guard namingNames.values.allSatisfy(\.isEmpty),
+              let candidate = record.oneToOneCandidate else { return }
+        namingNames[candidate.speaker] = candidate.name
     }
 }
 
@@ -136,6 +150,11 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
         if model.route != route { model.goToMain() }
         model.route = route
         if route == .settings { model.settingsForm.load(from: state) }
+        if case .naming(let id) = route,
+           let record = state.awaitingNames.first(where: { $0.id == id })
+               ?? state.transcripts.load(id) {
+            model.prefillNaming(record)
+        }
         model.resetForm(defaultPreset: state.settings.presets.first?.name ?? "Meeting")
         tick()
 
@@ -258,7 +277,9 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     private func start() {
         state.start(title: model.title,
                     presetName: model.presetName,
-                    participants: model.participants)
+                    participants: model.participants,
+                    speakerCount: model.speakerCount,
+                    speakersStrict: model.speakersStrict)
         model.resetForm(defaultPreset: state.settings.presets.first?.name ?? "Meeting")
         tick()
         startTicking()
@@ -441,6 +462,7 @@ private struct MainRoute: View {
                                tint: Theme.accent, spinning: false, symbol: "person.wave.2") {
                         PendingAction(label: "Name", tint: Theme.accent) {
                             model.route = .naming(record.id)
+                            model.prefillNaming(record)
                         }
                     }
                 }

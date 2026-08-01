@@ -28,6 +28,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             self?.refreshIcon()
             self?.sessionsPanel.phaseChanged()
         }
+        // Clicking a "speakers to name" notification lands in the naming view.
+        Notifier.onOpenNaming = { [weak self] id in
+            guard let self else { return }
+            self.sessionsPanel.show(from: self.statusItem.button, route: .naming(id))
+        }
         refreshIcon()
     }
 

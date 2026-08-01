@@ -13,6 +13,8 @@ enum Theme {
     static let accent = Color(red: 0.361, green: 0.416, blue: 0.961)
     static let accentDim = Color(red: 0.361, green: 0.416, blue: 0.961, opacity: 0.16)
     static let recording = Color(red: 0.925, green: 0.353, blue: 0.161)
+    /// Cautionary but not alarming: the speaker-count mismatch line.
+    static let warning = Color(red: 0.945, green: 0.702, blue: 0.278)
     static let text = Color.white
     static let dim = Color(white: 0.63)
     static let faint = Color(white: 0.42)

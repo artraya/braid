@@ -386,12 +386,49 @@ struct StartForm: View {
                                     set: { model.participants = $0 }))
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(onStart)
-            Text("Names are hints for the summary. Anyone who joins is still picked up.")
+
+            HStack(spacing: 8) {
+                Text("Voices on the far end")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.dim)
+                Spacer(minLength: 0)
+                Picker("", selection: Binding(get: { model.speakerCount },
+                                              set: { model.speakerCount = $0 })) {
+                    Text("Auto").tag(Int?.none)
+                    ForEach(1..<7) { n in
+                        Text("\(n)").tag(Int?.some(n))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 74)
+                if model.speakerCount != nil {
+                    Toggle("exactly", isOn: Binding(get: { model.speakersStrict },
+                                                    set: { model.speakersStrict = $0 }))
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.dim)
+                        .help("Also cap the count. Anyone who joins late is merged into these voices.")
+                }
+            }
+
+            Text(footer)
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.faint)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
         .background(Theme.card,
                     in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
+    }
+
+    /// The line under the form owns whatever risk the current choice carries.
+    private var footer: String {
+        guard let count = model.speakerCount else {
+            return "Names are hints for the summary. Anyone who joins is still picked up."
+        }
+        return model.speakersStrict
+            ? "Exactly \(count): late joiners will be merged into these voices."
+            : "At least \(count): helps split similar voices. Anyone who joins is still picked up."
     }
 }

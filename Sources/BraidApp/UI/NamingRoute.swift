@@ -45,6 +45,19 @@ struct NamingRoute: View {
             .foregroundStyle(Theme.dim)
             .fixedSize(horizontal: false, vertical: true)
 
+        if let mismatch = record.speakerMismatch {
+            Label(mismatch.message, systemImage: "person.crop.circle.badge.questionmark")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if stats.count > 1 {
+            Text("Same person split in two? Give both voices the same name to merge them.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.faint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
         ScrollView {
             VStack(spacing: 10) {
                 ForEach(stats) { stat in

@@ -199,15 +199,101 @@ import Testing
     #expect(body["keyterms_prompt"] == nil)
 }
 
-/// R6: no request may cap the speaker count. Capping it at Participants+1 meant
-/// a late joiner was folded into an existing speaker.
-@Test func noRequestEverConstrainsTheSpeakerCount() {
+/// Amended R6: by default no request carries a speaker count. Capping it at
+/// Participants+1 once meant a late joiner was folded into an existing speaker.
+@Test func defaultRequestsNeverConstrainTheSpeakerCount() {
     for diarize in [true, false] {
         let body = AssemblyAIAdapter.requestBody(
             audioURL: "https://example/x", diarize: diarize, keyTerms: ["Acme Geo"])
         #expect(body["speaker_options"] == nil)
         #expect(body["speakers_expected"] == nil)
     }
+}
+
+/// Amended R6: an asserted count is sent as a minimum — it can fix two voices
+/// heard as one, and can never fold a late joiner into an existing speaker.
+@Test func assertedCountSendsTheMinimumOnly() throws {
+    let body = AssemblyAIAdapter.requestBody(
+        audioURL: "https://example/x", diarize: true, keyTerms: [],
+        expectedSpeakers: Session.SpeakerExpectation(count: 3))
+    let options = try #require(body["speaker_options"] as? [String: Any])
+    #expect(options["min_speakers_expected"] as? Int == 3)
+    #expect(options["max_speakers_expected"] == nil)
+    #expect(body["speakers_expected"] == nil)
+}
+
+/// Amended R6: only the explicit strict choice adds the maximum — the setting
+/// whose label owns the late-joiner cost.
+@Test func strictAddsTheMaximum() throws {
+    let body = AssemblyAIAdapter.requestBody(
+        audioURL: "https://example/x", diarize: true, keyTerms: [],
+        expectedSpeakers: Session.SpeakerExpectation(count: 2, strict: true))
+    let options = try #require(body["speaker_options"] as? [String: Any])
+    #expect(options["min_speakers_expected"] as? Int == 2)
+    #expect(options["max_speakers_expected"] as? Int == 2)
+}
+
+/// Amended R6: the undiarized Mic request never carries speaker fields, even
+/// when the Session asserted a count.
+@Test func micRequestNeverCarriesSpeakerFields() {
+    let body = AssemblyAIAdapter.requestBody(
+        audioURL: "https://example/x", diarize: false, keyTerms: [],
+        expectedSpeakers: Session.SpeakerExpectation(count: 4, strict: true))
+    #expect(body["speaker_options"] == nil)
+    #expect(body["speakers_expected"] == nil)
+}
+
+/// Amended R6: Participants reach the Provider as vocabulary — the names R11
+/// needs as transcript evidence arrive spelled correctly — never as a count.
+@Test func participantsJoinTheKeyTermsDeduplicated() {
+    let session = Session(title: "Sync", presetName: "Meeting",
+                          participants: ["Sarah", "acme geo", "Tom"],
+                          startedAt: Date())
+    let merged = session.mergedKeyTerms(global: ["Acme Geo", "SlopeWatch"])
+    #expect(merged == ["Acme Geo", "SlopeWatch", "Sarah", "Tom"])
+
+    let body = AssemblyAIAdapter.requestBody(
+        audioURL: "https://example/x", diarize: true, keyTerms: merged)
+    #expect(body["keyterms_prompt"] as? [String] == ["Acme Geo", "SlopeWatch", "Sarah", "Tom"])
+    #expect(body["speaker_options"] == nil)
+}
+
+// MARK: - Speaker count mismatch (amended R6)
+
+@Test func mismatchComparesAgainstTheAssertedCountFirst() {
+    let session = Session(title: "Sync", presetName: "Meeting",
+                          participants: ["Sarah", "Tom"],
+                          expectedSpeakers: .init(count: 2),
+                          startedAt: Date())
+    // Matches the asserted count: no warning, whatever Participants say.
+    #expect(session.speakerMismatch(heardRemoteSpeakers: 2) == nil)
+
+    let mismatch = session.speakerMismatch(heardRemoteSpeakers: 3)
+    #expect(mismatch == Session.SpeakerCountMismatch(heard: 3, expected: 2, asserted: true))
+    #expect(mismatch?.message == "Heard 3 voices; you set 2.")
+}
+
+@Test func mismatchFallsBackToParticipantsAsASoftSignal() {
+    let session = Session(title: "Sync", presetName: "Meeting",
+                          participants: ["Sarah", "Tom"], startedAt: Date())
+    #expect(session.speakerMismatch(heardRemoteSpeakers: 2) == nil)
+    let mismatch = session.speakerMismatch(heardRemoteSpeakers: 1)
+    #expect(mismatch == Session.SpeakerCountMismatch(heard: 1, expected: 2, asserted: false))
+    // Fewer than expected: the audio is gone (R7), so the advice is the next call.
+    #expect(mismatch?.message ==
+        "Heard 1 voice; you listed 2 participants. If voices were merged, set the speaker count before the next call.")
+}
+
+@Test func noExpectationMeansNoWarningEver() {
+    let session = Session(title: "Sync", presetName: "Meeting",
+                          participants: [], startedAt: Date())
+    for heard in 0...5 {
+        #expect(session.speakerMismatch(heardRemoteSpeakers: heard) == nil)
+    }
+    // Zero heard is R16's territory, not a diarization mismatch.
+    let expecting = Session(title: "Sync", presetName: "Meeting", participants: [],
+                            expectedSpeakers: .init(count: 2), startedAt: Date())
+    #expect(expecting.speakerMismatch(heardRemoteSpeakers: 0) == nil)
 }
 
 // MARK: - Speaker stats and renaming
@@ -258,24 +344,52 @@ import Testing
 /// Records what the pipeline actually asked the cloud to do, and can be made
 /// slow enough to cancel mid-flight.
 private final class SpyProvider: STTProvider, @unchecked Sendable {
+    struct Call: Sendable {
+        let diarize: Bool
+        let keyTerms: [String]
+        let expectedSpeakers: Session.SpeakerExpectation?
+    }
+
     let name = "spy"
     let delay: Duration
+    /// Speakers returned for the diarized (Remote) request.
+    let remoteSpeakers: [String]
     private let lock = NSLock()
-    private var _calls = 0
-    var calls: Int { lock.withLock { _calls } }
+    private var _calls: [Call] = []
+    var calls: Int { lock.withLock { _calls.count } }
+    var recorded: [Call] { lock.withLock { _calls } }
     /// Signals that transcription has genuinely started, so a test never
     /// cancels before the work is under way.
     let started = AsyncStream<Void>.makeStream()
 
-    init(delay: Duration = .milliseconds(50)) {
+    init(delay: Duration = .milliseconds(50), remoteSpeakers: [String] = ["A"]) {
         self.delay = delay
+        self.remoteSpeakers = remoteSpeakers
     }
 
-    func transcribe(track: URL, diarize: Bool, keyTerms: [String]) async throws -> [Utterance] {
-        lock.withLock { _calls += 1 }
+    func transcribe(track: URL, diarize: Bool, keyTerms: [String],
+                    expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance] {
+        lock.withLock {
+            _calls.append(Call(diarize: diarize, keyTerms: keyTerms,
+                               expectedSpeakers: expectedSpeakers))
+        }
         started.continuation.yield()
         try await Task.sleep(for: delay)
-        return [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
+        guard diarize else {
+            return [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
+        }
+        return remoteSpeakers.enumerated().map { index, speaker in
+            Utterance(speaker: speaker, start: Double(index) * 2 + 2,
+                      end: Double(index) * 2 + 3, text: "line \(index)")
+        }
+    }
+}
+
+/// Lets a Job run to completion without the network.
+private struct StubSummariser: NoteSummarising {
+    func summarise(transcript: Transcript, session: Session,
+                   preset: Preset) async throws -> Summariser.Output {
+        Summariser.Output(noteBody: "# Stub note", inputTokens: 100, outputTokens: 50)
     }
 }
 
@@ -295,14 +409,17 @@ private func writeTestCAF(at url: URL, seconds: Double = 0.25) throws {
 }
 
 private func makeQueueEnvironment(provider: STTProvider, root: URL,
+                                  summariser: any NoteSummarising = Summariser(apiKey: "unused"),
+                                  keyTerms: [String] = [],
                                   onEvent: @escaping @Sendable (JobQueue.Event) -> Void = { _ in })
     -> JobQueue.Environment {
     let defaults = UserDefaults(suiteName: "no.braid.test.\(UUID().uuidString)")!
     let settings = SettingsStore(defaults: defaults)
     settings.vaultPath = root.appendingPathComponent("vault").path
+    settings.keyTerms = keyTerms
     return JobQueue.Environment(
         provider: provider,
-        summariser: Summariser(apiKey: "unused"),
+        summariser: summariser,
         settings: settings,
         jobsRoot: root.appendingPathComponent("jobs"),
         transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts")),
@@ -424,6 +541,122 @@ private func makeQueueEnvironment(provider: STTProvider, root: URL,
     // A genuine network failure is still transient.
     let offline = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
     #expect(!PipelineError.classify(transport: offline, context: "x").isCancellation)
+}
+
+// MARK: - Mismatch surfaces after delivery, never blocking it (amended R6)
+
+/// Three voices heard against an asserted two: the Note still delivers
+/// hands-off, the warning rides the speakersDetected event and the
+/// NamingRecord, and the Recording is deleted as on any success.
+@Test func mismatchWarnsAfterDeliveryWithoutBlockingIt() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mismatch-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let provider = SpyProvider(delay: .milliseconds(1), remoteSpeakers: ["A", "B", "C"])
+    let events = Mutex<[JobQueue.Event]>([])
+    let done = AsyncStream<URL>.makeStream()
+    let env = makeQueueEnvironment(
+        provider: provider, root: root, summariser: StubSummariser(),
+        keyTerms: ["Acme Geo"],
+        onEvent: { event in
+            events.withLock { $0.append(event) }
+            if case .jobDone(_, let noteURL) = event {
+                done.continuation.yield(noteURL)
+            }
+        })
+
+    let session = Session(title: "Mismatch", presetName: "Meeting",
+                          participants: ["Sarah"],
+                          expectedSpeakers: .init(count: 2),
+                          startedAt: Date(), recordedDuration: 60)
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    for track in ["mic.caf", "remote.caf"] {
+        try writeTestCAF(at: dir.appendingPathComponent(track))
+    }
+
+    let queue = JobQueue(env: env)
+    await queue.enqueue(session: session, remoteSilent: false)
+
+    var doneIterator = done.stream.makeAsyncIterator()
+    let noteURL = try #require(await doneIterator.next())
+
+    // Delivered hands-off: Note on disk, Recording gone.
+    #expect(FileManager.default.fileExists(atPath: noteURL.path))
+    #expect(!FileManager.default.fileExists(atPath: dir.path))
+
+    // The warning rode along after delivery.
+    let detected = events.withLock { $0 }.compactMap { event
+        -> (Int, Session.SpeakerCountMismatch?)? in
+        if case .speakersDetected(_, let stats, let mismatch) = event {
+            return (stats.count, mismatch)
+        }
+        return nil
+    }
+    #expect(detected.count == 1)
+    #expect(detected.first?.0 == 3)
+    #expect(detected.first?.1 ==
+        Session.SpeakerCountMismatch(heard: 3, expected: 2, asserted: true))
+
+    // And persisted for the naming sheet.
+    let record = try #require(
+        TranscriptStore(root: root.appendingPathComponent("transcripts")).load(session.id))
+    #expect(record.speakerMismatch?.heard == 3)
+
+    // The wiring the mismatch depends on: the asserted count reached only the
+    // diarized request, and Participants joined the Key Terms on both.
+    let calls = provider.recorded
+    #expect(calls.count == 2)
+    for call in calls {
+        #expect(call.keyTerms == ["Acme Geo", "Sarah"])
+        #expect(call.expectedSpeakers == (call.diarize ? .init(count: 2) : nil))
+    }
+}
+
+// MARK: - Merging and the 1:1 candidate
+
+/// The merge affordance: the same name typed on two voices folds them into one
+/// speaker everywhere.
+@Test func sameNameOnTwoSpeakersMergesThem() {
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Me", start: 0, end: 1, text: "a"),
+        Utterance(speaker: "Speaker 1", start: 1, end: 2, text: "b"),
+        Utterance(speaker: "Speaker 2", start: 2, end: 3, text: "c"),
+        Utterance(speaker: "Speaker 1", start: 3, end: 4, text: "d"),
+    ])
+    let merged = t.renamingSpeakers(["Speaker 1": "Sarah", "Speaker 2": "Sarah"])
+    #expect(merged.utterances.map(\.speaker) == ["Me", "Sarah", "Sarah", "Sarah"])
+    #expect(merged.remoteSpeakers == ["Sarah"])
+    #expect(merged.remoteSpeakerStats().count == 1)
+}
+
+@Test func oneToOneCandidateNeedsExactlyOneVoiceAndOneParticipant() {
+    func record(participants: [String], speakers: [String],
+                namesApplied: Bool = false) -> NamingRecord {
+        var record = NamingRecord(
+            session: Session(title: "Sync", presetName: "Meeting",
+                             participants: participants, startedAt: Date()),
+            transcript: Transcript(utterances: speakers.map {
+                Utterance(speaker: $0, start: 0, end: 1, text: "x")
+            }),
+            provider: "spy", costUSD: 0, notePath: "/tmp/n.md",
+            transcriptPath: "/tmp/t.md", noteHash: "h")
+        record.namesApplied = namesApplied
+        return record
+    }
+
+    let candidate = record(participants: ["Priya"], speakers: ["Speaker 1"]).oneToOneCandidate
+    #expect(candidate?.speaker == "Speaker 1")
+    #expect(candidate?.name == "Priya")
+
+    // Anything but exactly one of each is a guess, and Braid does not guess.
+    #expect(record(participants: ["Priya", "Tom"], speakers: ["Speaker 1"]).oneToOneCandidate == nil)
+    #expect(record(participants: ["Priya"], speakers: ["Speaker 1", "Speaker 2"]).oneToOneCandidate == nil)
+    #expect(record(participants: [], speakers: ["Speaker 1"]).oneToOneCandidate == nil)
+    // Already named: stop offering.
+    #expect(record(participants: ["Priya"], speakers: ["Speaker 1"],
+                   namesApplied: true).oneToOneCandidate == nil)
 }
 
 // MARK: - Auto-end detection

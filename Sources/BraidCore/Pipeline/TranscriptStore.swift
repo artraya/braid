@@ -24,10 +24,14 @@ public struct NamingRecord: Sendable, Codable, Identifiable {
     /// Set once the user has named speakers. The record is kept afterwards so a
     /// name can be corrected, but it stops prompting.
     public var namesApplied = false
+    /// Heard-vs-expected disagreement at delivery, shown in the naming sheet.
+    /// Optional so records persisted before this field decode unchanged.
+    public var speakerMismatch: Session.SpeakerCountMismatch?
 
     public init(session: Session, transcript: Transcript, provider: String,
                 costUSD: Double, notePath: String, transcriptPath: String,
-                noteHash: String, completedAt: Date = Date()) {
+                noteHash: String, completedAt: Date = Date(),
+                speakerMismatch: Session.SpeakerCountMismatch? = nil) {
         self.session = session
         self.transcript = transcript
         self.provider = provider
@@ -36,6 +40,19 @@ public struct NamingRecord: Sendable, Codable, Identifiable {
         self.transcriptPath = transcriptPath
         self.noteHash = noteHash
         self.completedAt = completedAt
+        self.speakerMismatch = speakerMismatch
+    }
+
+    /// The one case safe to offer as a single click: exactly one voice heard,
+    /// exactly one Participant listed. Still user-confirmed — nothing is ever
+    /// applied unasked (R6a) — but confirming needs no typing.
+    public var oneToOneCandidate: (speaker: String, name: String)? {
+        guard !namesApplied,
+              let speaker = transcript.remoteSpeakers.first,
+              transcript.remoteSpeakers.count == 1,
+              let name = session.participants.first,
+              session.participants.count == 1 else { return nil }
+        return (speaker, name)
     }
 
     public static func hash(_ contents: String) -> String {

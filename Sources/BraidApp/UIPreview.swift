@@ -192,7 +192,9 @@ enum UIPreview {
         ])
         return NamingRecord(session: session, transcript: transcript, provider: "assemblyai",
                             costUSD: 1.94, notePath: "/tmp/note.md",
-                            transcriptPath: "/tmp/transcript.md", noteHash: "")
+                            transcriptPath: "/tmp/transcript.md", noteHash: "",
+                            speakerMismatch: Session.SpeakerCountMismatch(
+                                heard: 2, expected: 3, asserted: false))
     }
 
     private static func previewJob(_ title: String, minutes: Double) -> Job {

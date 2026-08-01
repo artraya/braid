@@ -1,14 +1,27 @@
 import Foundation
 import os
 
+/// What the pipeline needs from a summariser. Exists so tests can drive a Job
+/// to completion without the network; `Summariser` is the only live conformer.
+public protocol NoteSummarising: Sendable {
+    func summarise(transcript: Transcript, session: Session,
+                   preset: Preset) async throws -> Summariser.Output
+}
+
 /// The separate Claude API call that turns a Transcript into a Note (SPEC
 /// Architecture): claude-opus-5 with adaptive thinking, plain URLSession HTTP
 /// (zero dependencies, ADR-0004), never the Provider's bundled summariser.
-public struct Summariser: Sendable {
+public struct Summariser: Sendable, NoteSummarising {
     public struct Output: Sendable {
         public let noteBody: String
         public let inputTokens: Int
         public let outputTokens: Int
+
+        public init(noteBody: String, inputTokens: Int, outputTokens: Int) {
+            self.noteBody = noteBody
+            self.inputTokens = inputTokens
+            self.outputTokens = outputTokens
+        }
     }
 
     let apiKey: String

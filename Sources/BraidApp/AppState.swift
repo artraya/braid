@@ -109,6 +109,9 @@ final class AppState {
             await self.refreshJobState()
         }
         Notifier.requestPermission()
+        Notifier.onApplyName = { [weak self] sessionID in
+            self?.applyOneToOneCandidate(sessionID: sessionID)
+        }
         // Launch at login (SPEC R15); only meaningful from the installed bundle.
         if Bundle.main.bundleIdentifier == "no.braid.app" {
             try? SMAppService.mainApp.register()
@@ -133,12 +136,23 @@ final class AppState {
                             body: "Check the System Audio Recording permission. The note will only contain your side.")
         case .jobCancelled:
             break   // the user just asked for this; a notification would be noise
-        case .speakersDetected(let job, let stats):
+        case .speakersDetected(let job, let stats, let mismatch):
             refreshNamingState()
             let count = stats.count
-            Notifier.notify(
+            let candidate = transcripts.load(job.id)?.oneToOneCandidate
+            var body = job.session.title
+            if let mismatch {
+                body += " — \(mismatch.message)"
+            } else if let candidate {
+                body += " — one voice heard. Apply \u{201C}\(candidate.name)\u{201D}?"
+            } else {
+                body += " — name them from the menu to rewrite the note."
+            }
+            Notifier.notifySpeakers(
+                sessionID: job.id,
                 title: "\(count) speaker\(count == 1 ? "" : "s") to name",
-                body: "\(job.session.title) — name them from the menu to rewrite the note.")
+                body: body,
+                offerApply: candidate != nil)
         }
         Task { await refreshJobState() }
     }
@@ -232,9 +246,17 @@ final class AppState {
         }
     }
 
+    /// The notification's Apply button: the user has confirmed the 1:1
+    /// candidate, so this is explicit action, not auto-assignment (R6a).
+    func applyOneToOneCandidate(sessionID: String) {
+        guard let candidate = transcripts.load(sessionID)?.oneToOneCandidate else { return }
+        applyNames([candidate.speaker: candidate.name], toSessionID: sessionID) { _ in }
+    }
+
     // MARK: - Session control
 
-    func start(title: String, presetName: String, participants: String) {
+    func start(title: String, presetName: String, participants: String,
+               speakerCount: Int? = nil, speakersStrict: Bool = false) {
         guard phase == .idle else { return }
         bootstrap()
         let names = participants
@@ -244,8 +266,12 @@ final class AppState {
         let resolvedTitle = title.trimmingCharacters(in: .whitespaces).isEmpty
             ? presetName
             : title.trimmingCharacters(in: .whitespaces)
+        let expectation = speakerCount.map {
+            Session.SpeakerExpectation(count: $0, strict: speakersStrict)
+        }
         let session = Session(title: resolvedTitle, presetName: presetName,
-                              participants: names, startedAt: Date())
+                              participants: names, expectedSpeakers: expectation,
+                              startedAt: Date())
         let dir = JobQueue.appSupportURL.appendingPathComponent("jobs")
             .appendingPathComponent(session.id)
         do {

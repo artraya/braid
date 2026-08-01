@@ -16,14 +16,14 @@ public struct SpeakerNamer: Sendable {
         public let wroteNewPair: Bool
     }
 
-    let summariser: Summariser
+    let summariser: any NoteSummarising
     let settings: SettingsStore
     let costTable: CostTable
     let store: TranscriptStore
     let sessions: SessionIndex
     let log = Logger(subsystem: "no.braid.app", category: "pipeline")
 
-    public init(summariser: Summariser, settings: SettingsStore,
+    public init(summariser: any NoteSummarising, settings: SettingsStore,
                 costTable: CostTable = .current, store: TranscriptStore = TranscriptStore(),
                 sessions: SessionIndex = SessionIndex()) {
         self.summariser = summariser

@@ -182,11 +182,14 @@ if let i = args.firstIndex(of: "--process-test") {
                 print("WARNING: remote track silent (R16)")
             case .jobCancelled(let job):
                 print("job cancelled: \(job.id)")
-            case .speakersDetected(_, let stats):
+            case .speakersDetected(_, let stats, let mismatch):
                 let described = stats
                     .map { "\($0.speaker) (\(Int($0.totalSeconds))s)" }
                     .joined(separator: ", ")
                 print("speakers detected: \(described)")
+                if let mismatch {
+                    print("WARNING: speaker mismatch — \(mismatch.message)")
+                }
             }
         })
     let queue = JobQueue(env: env)
