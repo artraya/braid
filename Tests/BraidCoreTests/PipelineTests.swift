@@ -385,11 +385,18 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
     }
 }
 
-/// Lets a Job run to completion without the network.
-private struct StubSummariser: NoteSummarising {
+/// Lets a Job run to completion without the network, recording what it was
+/// asked to summarise.
+private final class StubSummariser: NoteSummarising, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _transcripts: [Transcript] = []
+    var transcripts: [Transcript] { lock.withLock { _transcripts } }
+    var callCount: Int { lock.withLock { _transcripts.count } }
+
     func summarise(transcript: Transcript, session: Session,
                    preset: Preset) async throws -> Summariser.Output {
-        Summariser.Output(noteBody: "# Stub note", inputTokens: 100, outputTokens: 50)
+        lock.withLock { _transcripts.append(transcript) }
+        return Summariser.Output(noteBody: "# Stub note", inputTokens: 100, outputTokens: 50)
     }
 }
 
@@ -631,32 +638,85 @@ private func makeQueueEnvironment(provider: STTProvider, root: URL,
     #expect(merged.remoteSpeakerStats().count == 1)
 }
 
-@Test func oneToOneCandidateNeedsExactlyOneVoiceAndOneParticipant() {
-    func record(participants: [String], speakers: [String],
-                namesApplied: Bool = false) -> NamingRecord {
-        var record = NamingRecord(
-            session: Session(title: "Sync", presetName: "Meeting",
-                             participants: participants, startedAt: Date()),
-            transcript: Transcript(utterances: speakers.map {
-                Utterance(speaker: $0, start: 0, end: 1, text: "x")
-            }),
-            provider: "spy", costUSD: 0, notePath: "/tmp/n.md",
-            transcriptPath: "/tmp/t.md", noteHash: "h")
-        record.namesApplied = namesApplied
-        return record
+/// Runs a Job to completion and returns everything the assertions need.
+private func runFixtureJob(
+    session: Session, remoteSpeakers: [String], root: URL
+) async throws -> (noteURL: URL, events: [JobQueue.Event],
+                   summariser: StubSummariser, record: NamingRecord?) {
+    let provider = SpyProvider(delay: .milliseconds(1), remoteSpeakers: remoteSpeakers)
+    let summariser = StubSummariser()
+    let events = Mutex<[JobQueue.Event]>([])
+    let done = AsyncStream<URL>.makeStream()
+    let env = makeQueueEnvironment(
+        provider: provider, root: root, summariser: summariser,
+        onEvent: { event in
+            events.withLock { $0.append(event) }
+            if case .jobDone(_, let noteURL) = event {
+                done.continuation.yield(noteURL)
+            }
+        })
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    for track in ["mic.caf", "remote.caf"] {
+        try writeTestCAF(at: dir.appendingPathComponent(track))
     }
+    let queue = JobQueue(env: env)
+    await queue.enqueue(session: session, remoteSilent: false)
+    var iterator = done.stream.makeAsyncIterator()
+    let noteURL = try #require(await iterator.next())
+    let record = TranscriptStore(root: root.appendingPathComponent("transcripts"))
+        .load(session.id)
+    return (noteURL, events.withLock { $0 }, summariser, record)
+}
 
-    let candidate = record(participants: ["Priya"], speakers: ["Speaker 1"]).oneToOneCandidate
-    #expect(candidate?.speaker == "Speaker 1")
-    #expect(candidate?.name == "Priya")
+/// Amended R6a: one declared Participant, one heard voice — the Note arrives
+/// already named, with one summarise call and nothing prompting.
+@Test func autoAssignNamesTheSingleVoiceBeforeSummarising() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("autoassign-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
 
-    // Anything but exactly one of each is a guess, and Braid does not guess.
-    #expect(record(participants: ["Priya", "Tom"], speakers: ["Speaker 1"]).oneToOneCandidate == nil)
-    #expect(record(participants: ["Priya"], speakers: ["Speaker 1", "Speaker 2"]).oneToOneCandidate == nil)
-    #expect(record(participants: [], speakers: ["Speaker 1"]).oneToOneCandidate == nil)
-    // Already named: stop offering.
-    #expect(record(participants: ["Priya"], speakers: ["Speaker 1"],
-                   namesApplied: true).oneToOneCandidate == nil)
+    let session = Session(title: "One on one", presetName: "Meeting",
+                          participants: ["Priya"], startedAt: Date(),
+                          recordedDuration: 60)
+    let run = try await runFixtureJob(session: session, remoteSpeakers: ["A"], root: root)
+
+    // The Summariser saw the name — exactly once, before delivery.
+    #expect(run.summariser.callCount == 1)
+    #expect(run.summariser.transcripts.first?.remoteSpeakers == ["Priya"])
+
+    // The delivered transcript file carries the name too.
+    let record = try #require(run.record)
+    let transcriptText = try String(
+        contentsOf: URL(fileURLWithPath: record.transcriptPath), encoding: .utf8)
+    #expect(transcriptText.contains("Priya:"))
+    #expect(!transcriptText.contains("Speaker 1"))
+
+    // Already named: nothing prompts.
+    #expect(record.namesApplied)
+    #expect(!run.events.contains { if case .speakersDetected = $0 { return true }
+                                   return false })
+}
+
+/// Amended R6a: more voices than declared names is a guess, and Braid does not
+/// guess among voices — the naming flow stays exactly as it was.
+@Test func autoAssignNeverGuessesAmongVoices() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("autoassign-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let session = Session(title: "Group call", presetName: "Meeting",
+                          participants: ["Priya"], startedAt: Date(),
+                          recordedDuration: 60)
+    let run = try await runFixtureJob(session: session,
+                                      remoteSpeakers: ["A", "B", "C"], root: root)
+
+    #expect(run.summariser.transcripts.first?.remoteSpeakers ==
+        ["Speaker 1", "Speaker 2", "Speaker 3"])
+    let record = try #require(run.record)
+    #expect(!record.namesApplied)
+    #expect(run.events.contains { if case .speakersDetected = $0 { return true }
+                                  return false })
 }
 
 // MARK: - Auto-end detection

@@ -66,6 +66,8 @@ enum UIPreview {
                                                recording: .recording)),
             ("settings", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                               route: .settings)),
+            ("history", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                             route: .history)),
         ]
         for (name, preview) in cases {
             let panel = FloatingPanel(
@@ -109,6 +111,9 @@ enum UIPreview {
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    startFormOpen: true),
               named: "panel-start-form", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   startFormOpen: true, speakerCount: 2),
+              named: "panel-start-form-count", into: directory)
         write(SessionsPanelPreview(sessions: [], usage: Usage.empty),
               named: "panel-empty", into: directory)
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
@@ -139,6 +144,9 @@ enum UIPreview {
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    route: .settings),
               named: "panel-settings", into: directory)
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   route: .history),
+              named: "panel-history", into: directory)
         if let naming = previewNamingRecord {
             write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                        route: .naming(naming.id), awaitingNames: [naming]),
@@ -250,6 +258,9 @@ private struct SessionsPanelPreview: View {
     let sessions: [SessionRecord]
     let usage: Usage
     var startFormOpen = false
+    /// Fed through the real selection path, so the strict-by-default rule the
+    /// snapshot shows is the one the app actually runs.
+    var speakerCount: Int?
     var pendingJobs: [Job] = []
     var cancelledJobs: [Job] = []
     var arrowX: CGFloat?
@@ -276,6 +287,7 @@ private struct SessionsPanelPreview: View {
         let model = SessionsPanelModel()
         model.presetName = "Meeting"
         model.showingStartForm = startFormOpen
+        if let speakerCount { model.selectSpeakerCount(speakerCount) }
         model.arrowX = arrowX ?? Theme.panelWidth / 2
         model.route = route
         model.confirmation = confirmation

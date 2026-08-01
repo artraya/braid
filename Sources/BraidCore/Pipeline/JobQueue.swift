@@ -295,9 +295,24 @@ public actor JobQueue {
             expectedSpeakers: job.session.expectedSpeakers)
         let (micUtterances, remoteUtterances) = try await (micTask, remoteTask)
 
-        let transcript = mergeTranscripts(
+        var transcript = mergeTranscripts(
             mic: micUtterances, remote: remoteUtterances,
             pauseSpans: job.session.pauseSpans)
+
+        // R6a (amended 2026-08-01): exactly one declared Participant and
+        // exactly one heard voice is unambiguous, so the voice is named before
+        // the Summariser runs — the Note arrives named, no second Claude call,
+        // nothing to click. Every other combination keeps the naming flow;
+        // Braid still never guesses *among* voices.
+        var autoAssigned = false
+        if job.session.participants.count == 1,
+           transcript.remoteSpeakers.count == 1,
+           let voice = transcript.remoteSpeakers.first {
+            let name = job.session.participants[0]
+            transcript = transcript.renamingSpeakers([voice: name])
+            autoAssigned = true
+            log.notice("auto-assigned the single voice in \(job.id, privacy: .public) to the declared participant")
+        }
 
         // Transcription is paid for by now; the summary is not.
         try checkCancelled()
@@ -344,6 +359,8 @@ public actor JobQueue {
         // Vault only holds markdown, and the Recording is about to go. Any
         // heard-vs-expected mismatch is computed here, after delivery, so it
         // can only ever inform — never block (Journey step 7 stays hands-off).
+        // An auto-assigned Session stores its record already named: nothing
+        // prompts, but a correction stays possible.
         let stats = transcript.remoteSpeakerStats()
         if !stats.isEmpty {
             let mismatch = job.session.speakerMismatch(heardRemoteSpeakers: stats.count)
@@ -351,13 +368,17 @@ public actor JobQueue {
                 log.warning("speaker mismatch for \(job.id, privacy: .public): \(mismatch.message, privacy: .public)")
             }
             let noteContents = (try? String(contentsOf: written.noteURL, encoding: .utf8)) ?? ""
-            env.transcripts.save(NamingRecord(
+            var record = NamingRecord(
                 session: job.session, transcript: transcript, provider: env.provider.name,
                 costUSD: cost, notePath: written.noteURL.path,
                 transcriptPath: written.transcriptURL.path,
                 noteHash: NamingRecord.hash(noteContents),
-                speakerMismatch: mismatch))
-            env.onEvent(.speakersDetected(job, stats, mismatch))
+                speakerMismatch: mismatch)
+            record.namesApplied = autoAssigned
+            env.transcripts.save(record)
+            if !autoAssigned {
+                env.onEvent(.speakersDetected(job, stats, mismatch))
+            }
         }
 
         // Only a confirmed-success Job may delete a Recording (Operation).

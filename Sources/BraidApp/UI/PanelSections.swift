@@ -393,7 +393,7 @@ struct StartForm: View {
                     .foregroundStyle(Theme.dim)
                 Spacer(minLength: 0)
                 Picker("", selection: Binding(get: { model.speakerCount },
-                                              set: { model.speakerCount = $0 })) {
+                                              set: { model.selectSpeakerCount($0) })) {
                     Text("Auto").tag(Int?.none)
                     ForEach(1..<7) { n in
                         Text("\(n)").tag(Int?.some(n))
@@ -425,10 +425,10 @@ struct StartForm: View {
     /// The line under the form owns whatever risk the current choice carries.
     private var footer: String {
         guard let count = model.speakerCount else {
-            return "Names are hints for the summary. Anyone who joins is still picked up."
+            return "One name and one voice names itself. Anyone who joins is still picked up."
         }
         return model.speakersStrict
-            ? "Exactly \(count): late joiners will be merged into these voices."
+            ? "Exactly \(count): late joiners will be merged into these voices. Untick for at-least, or use Auto."
             : "At least \(count): helps split similar voices. Anyone who joins is still picked up."
     }
 }

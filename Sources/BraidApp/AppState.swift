@@ -109,9 +109,6 @@ final class AppState {
             await self.refreshJobState()
         }
         Notifier.requestPermission()
-        Notifier.onApplyName = { [weak self] sessionID in
-            self?.applyOneToOneCandidate(sessionID: sessionID)
-        }
         // Launch at login (SPEC R15); only meaningful from the installed bundle.
         if Bundle.main.bundleIdentifier == "no.braid.app" {
             try? SMAppService.mainApp.register()
@@ -139,20 +136,12 @@ final class AppState {
         case .speakersDetected(let job, let stats, let mismatch):
             refreshNamingState()
             let count = stats.count
-            let candidate = transcripts.load(job.id)?.oneToOneCandidate
-            var body = job.session.title
-            if let mismatch {
-                body += " — \(mismatch.message)"
-            } else if let candidate {
-                body += " — one voice heard. Apply \u{201C}\(candidate.name)\u{201D}?"
-            } else {
-                body += " — name them from the menu to rewrite the note."
-            }
+            let body = job.session.title + (mismatch.map { " — \($0.message)" }
+                ?? " — name them from the menu to rewrite the note.")
             Notifier.notifySpeakers(
                 sessionID: job.id,
                 title: "\(count) speaker\(count == 1 ? "" : "s") to name",
-                body: body,
-                offerApply: candidate != nil)
+                body: body)
         }
         Task { await refreshJobState() }
     }
@@ -244,13 +233,6 @@ final class AppState {
                 completion(.failure(error))
             }
         }
-    }
-
-    /// The notification's Apply button: the user has confirmed the 1:1
-    /// candidate, so this is explicit action, not auto-assignment (R6a).
-    func applyOneToOneCandidate(sessionID: String) {
-        guard let candidate = transcripts.load(sessionID)?.oneToOneCandidate else { return }
-        applyNames([candidate.speaker: candidate.name], toSessionID: sessionID) { _ in }
     }
 
     // MARK: - Session control

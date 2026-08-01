@@ -43,18 +43,6 @@ public struct NamingRecord: Sendable, Codable, Identifiable {
         self.speakerMismatch = speakerMismatch
     }
 
-    /// The one case safe to offer as a single click: exactly one voice heard,
-    /// exactly one Participant listed. Still user-confirmed — nothing is ever
-    /// applied unasked (R6a) — but confirming needs no typing.
-    public var oneToOneCandidate: (speaker: String, name: String)? {
-        guard !namesApplied,
-              let speaker = transcript.remoteSpeakers.first,
-              transcript.remoteSpeakers.count == 1,
-              let name = session.participants.first,
-              session.participants.count == 1 else { return nil }
-        return (speaker, name)
-    }
-
     public static func hash(_ contents: String) -> String {
         SHA256.hash(data: Data(contents.utf8))
             .map { String(format: "%02x", $0) }

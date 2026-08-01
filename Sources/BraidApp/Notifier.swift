@@ -11,24 +11,13 @@ enum Notifier {
 
     /// Set by StatusItemController: open the panel at the naming view.
     @MainActor static var onOpenNaming: ((String) -> Void)?
-    /// Set by AppState: apply the 1:1 candidate name (user just confirmed it).
-    @MainActor static var onApplyName: ((String) -> Void)?
 
-    private static let speakersCategory = "no.braid.speakers"
-    private static let applyAction = "no.braid.speakers.apply"
     private static let delegate = Delegate()
 
     static func requestPermission() {
         guard available else { return }
         let center = UNUserNotificationCenter.current()
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        // The Apply title is static (category registration); the name itself
-        // travels in the notification body.
-        let apply = UNNotificationAction(identifier: applyAction, title: "Apply name")
-        center.setNotificationCategories([
-            UNNotificationCategory(identifier: speakersCategory, actions: [apply],
-                                   intentIdentifiers: []),
-        ])
         center.delegate = delegate
     }
 
@@ -45,22 +34,18 @@ enum Notifier {
         UNUserNotificationCenter.current().add(request)
     }
 
-    /// The "speakers to name" notification. Clicking it opens the naming view;
-    /// when `offerApply` is set (the 1:1 case) it also carries an Apply button,
-    /// so the common one-on-one call is named in a single click.
-    static func notifySpeakers(sessionID: String, title: String, body: String,
-                               offerApply: Bool) {
+    /// The "speakers to name" notification. Clicking it opens the naming view.
+    /// (The v0.3.0 Apply button was removed: its only trigger case — one voice,
+    /// one Participant — is auto-assigned before delivery now.)
+    static func notifySpeakers(sessionID: String, title: String, body: String) {
         guard available else {
-            print("[notification] \(title): \(body)\(offerApply ? " [Apply]" : "")")
+            print("[notification] \(title): \(body)")
             return
         }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.userInfo = ["sessionID": sessionID]
-        if offerApply {
-            content.categoryIdentifier = speakersCategory
-        }
         let request = UNNotificationRequest(
             identifier: "speakers-\(sessionID)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -85,13 +70,10 @@ enum Notifier {
         ) {
             let userInfo = response.notification.request.content.userInfo
             let action = response.actionIdentifier
-            if let sessionID = userInfo["sessionID"] as? String {
+            if let sessionID = userInfo["sessionID"] as? String,
+               action == UNNotificationDefaultActionIdentifier {
                 Task { @MainActor in
-                    if action == Notifier.applyAction {
-                        Notifier.onApplyName?(sessionID)
-                    } else if action == UNNotificationDefaultActionIdentifier {
-                        Notifier.onOpenNaming?(sessionID)
-                    }
+                    Notifier.onOpenNaming?(sessionID)
                 }
             }
             completionHandler()

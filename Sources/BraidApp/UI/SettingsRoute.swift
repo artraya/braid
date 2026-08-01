@@ -83,6 +83,9 @@ struct SettingsRoute: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // This month at a glance, moved off the main view
+                    // (amended R18); cap warnings still notify on their own.
+                    UsageCard(usage: state.usage)
                     vault
                     keys
                     keyTerms

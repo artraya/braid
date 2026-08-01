@@ -122,6 +122,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         cost.isEnabled = false
         menu.addItem(cost)
 
+        let history = NSMenuItem(title: "History", action: #selector(historyTapped),
+                                 keyEquivalent: "")
+        history.target = self
+        menu.addItem(history)
         let settings = NSMenuItem(title: "Settings…", action: #selector(settingsTapped),
                                   keyEquivalent: ",")
         settings.target = self
@@ -136,6 +140,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc func openPanel() { sessionsPanel.show(from: statusItem.button) }
     @objc func settingsTapped() { sessionsPanel.show(from: statusItem.button, route: .settings) }
+    @objc func historyTapped() { sessionsPanel.show(from: statusItem.button, route: .history) }
     @objc func quitTapped() { NSApp.terminate(nil) }
 
     @objc func nameSpeakersTapped(_ sender: NSMenuItem) {

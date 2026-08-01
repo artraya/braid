@@ -15,6 +15,7 @@ import BraidCore
 final class SessionsPanelModel {
     enum Route: Equatable {
         case main
+        case history
         case naming(String)   // Session id
         case settings
     }
@@ -27,6 +28,13 @@ final class SessionsPanelModel {
     /// nil = Auto: the Provider decides how many voices it hears (amended R6).
     var speakerCount: Int?
     var speakersStrict = false
+
+    /// Picking a count means exactly that count unless the user unticks it
+    /// (owner decision 2026-08-01); Auto stays the late-joiner-tolerant choice.
+    func selectSpeakerCount(_ count: Int?) {
+        speakerCount = count
+        speakersStrict = count != nil
+    }
     /// Where the pointer sits, measured from the panel's left edge. Updated
     /// whenever the panel is placed, since it is clamped to the screen while
     /// the menu bar icon is not.
@@ -78,14 +86,6 @@ final class SessionsPanelModel {
         namingWorking = false
     }
 
-    /// Pre-fills the one safe case: one voice, one Participant. The user still
-    /// presses Apply — nothing is assigned unasked (R6a) — but the common
-    /// one-on-one call needs no typing.
-    func prefillNaming(_ record: NamingRecord) {
-        guard namingNames.values.allSatisfy(\.isEmpty),
-              let candidate = record.oneToOneCandidate else { return }
-        namingNames[candidate.speaker] = candidate.name
-    }
 }
 
 /// What the panel can ask the app to do. Bundled rather than passed as a dozen
@@ -150,11 +150,6 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
         if model.route != route { model.goToMain() }
         model.route = route
         if route == .settings { model.settingsForm.load(from: state) }
-        if case .naming(let id) = route,
-           let record = state.awaitingNames.first(where: { $0.id == id })
-               ?? state.transcripts.load(id) {
-            model.prefillNaming(record)
-        }
         model.resetForm(defaultPreset: state.settings.presets.first?.name ?? "Meeting")
         tick()
 
@@ -376,6 +371,8 @@ struct SessionsPanelView: View {
             switch model.route {
             case .main:
                 MainRoute(state: state, model: model, actions: actions, onConfirm: onConfirm)
+            case .history:
+                HistoryRoute(state: state, model: model, actions: actions)
             case .naming(let id):
                 NamingRoute(state: state, model: model, sessionID: id, actions: actions)
             case .settings:
@@ -388,8 +385,9 @@ struct SessionsPanelView: View {
     }
 }
 
-/// The everyday view: what is recording now, what it has cost this month, what
-/// is still processing, and what has already been delivered.
+/// The everyday view, deliberately minimal (owner decision 2026-08-01): only
+/// what needs attention now — the active recording, work in flight, voices to
+/// name — and the Record button. History and usage live one click deeper.
 private struct MainRoute: View {
     let state: AppState
     let model: SessionsPanelModel
@@ -400,7 +398,14 @@ private struct MainRoute: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            PanelHeader(title: recording ? "Recording" : "Sessions") {
+            PanelHeader(title: recording ? "Recording" : "Braid") {
+                Button { model.route = .history } label: {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.faint)
+                }
+                .buttonStyle(.plain)
+                .help("History")
                 Button { model.route = .settings } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 13))
@@ -418,9 +423,14 @@ private struct MainRoute: View {
                 RecordingSection(state: state, model: model, actions: actions)
             }
 
-            UsageCard(usage: state.usage)
             processingList
-            sessionList
+
+            if !state.setupComplete {
+                Text("Finish setup in Settings before recording.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.faint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             if !recording {
                 if model.showingStartForm {
@@ -462,36 +472,10 @@ private struct MainRoute: View {
                                tint: Theme.accent, spinning: false, symbol: "person.wave.2") {
                         PendingAction(label: "Name", tint: Theme.accent) {
                             model.route = .naming(record.id)
-                            model.prefillNaming(record)
                         }
                     }
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private var sessionList: some View {
-        if state.recentSessions.isEmpty {
-            Text(state.setupComplete
-                 ? "No sessions yet. Record one and the note lands in your vault."
-                 : "Finish setup in Settings before recording.")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.faint)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 18)
-        } else {
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(state.recentSessions) { session in
-                        SessionRow(session: session) { actions.openNote(session.notePath) }
-                    }
-                }
-            }
-            .scrollIndicators(.never)
-            // Fewer rows while recording, so the panel does not run down the
-            // screen when the recording block is also showing.
-            .frame(maxHeight: recording ? 118 : 232)
         }
     }
 
@@ -518,5 +502,36 @@ private struct MainRoute: View {
         }
         .buttonStyle(.plain)
         .disabled(!state.setupComplete)
+    }
+}
+
+/// Delivered Sessions, one click deep (amended R18): each row opens its Note.
+private struct HistoryRoute: View {
+    let state: AppState
+    let model: SessionsPanelModel
+    let actions: PanelActions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            PanelHeader(title: "History", back: { model.goToMain() })
+            if state.recentSessions.isEmpty {
+                Text("No sessions yet. Record one and the note lands in your vault.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.faint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 18)
+            } else {
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(state.recentSessions) { session in
+                            SessionRow(session: session) { actions.openNote(session.notePath) }
+                        }
+                    }
+                }
+                .scrollIndicators(.never)
+                .frame(maxHeight: 320)
+            }
+        }
+        .padding(Theme.padding)
     }
 }

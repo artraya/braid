@@ -32,8 +32,10 @@ whatever audio setup was used.
   it is closed.
 - Delivery is hands-off: a note lands without the user touching anything after
   Stop. Optional passes (naming) never block delivery.
-- Names are never guessed: attribution beyond generic labels requires transcript
-  evidence or explicit user action (SPEC R6a, R11).
+- Names are never guessed among voices: attribution beyond generic labels
+  requires transcript evidence, explicit user action, or the single unambiguous
+  case — exactly one declared Participant and exactly one heard voice, which
+  auto-assigns (owner decision 2026-08-01, amending R6a; SPEC R11).
 
 ## Operating posture
 
@@ -58,7 +60,9 @@ never blocks. No CI; scripts/test.sh is the gate.
 
 ## Current cycle
 
-[Speaker attribution](./cycles/2026-08-01-speaker-attribution.md)
+[Minimal panel, zero-touch naming](./cycles/2026-08-01-minimal-panel-zero-touch-naming.md),
+then [Echo bleed: detect and dedup](./cycles/2026-08-01-echo-bleed-detection-dedup.md).
+Shipped: [Speaker attribution](./cycles/2026-08-01-speaker-attribution.md) (v0.3.0).
 
 ## Full lifecycle
 
