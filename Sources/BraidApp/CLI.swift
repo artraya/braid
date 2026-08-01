@@ -180,6 +180,8 @@ if let i = args.firstIndex(of: "--process-test") {
                 if !transient { semaphore.signal() }
             case .remoteSilentWarning:
                 print("WARNING: remote track silent (R16)")
+            case .echoBleedWarning:
+                print("WARNING: speaker bleed confirmed — echoes will be cleaned")
             case .jobCancelled(let job):
                 print("job cancelled: \(job.id)")
             case .speakersDetected(_, let stats, let mismatch):

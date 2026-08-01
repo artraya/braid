@@ -136,6 +136,10 @@ enum UIPreview {
               named: "panel-recording-auto-end", into: directory)
         write(SessionsPanelPreview(
                 sessions: previewSessions, usage: previewUsage, recording: .recording,
+                bleedWarning: "Speakers are bleeding into your mic — plug in headphones. Duplicates will be cleaned from the note."),
+              named: "panel-recording-bleed", into: directory)
+        write(SessionsPanelPreview(
+                sessions: previewSessions, usage: previewUsage, recording: .recording,
                 confirmation: .init(action: .discardRecording,
                                     question: "Discard this recording?",
                                     detail: "The audio is deleted and no note is written. This cannot be undone.",
@@ -267,6 +271,7 @@ private struct SessionsPanelPreview: View {
     /// Drives the recording block at the top of the panel.
     var recording: AppState.Phase = .idle
     var autoEndIn: Int?
+    var bleedWarning: String?
     var confirmation: SessionsPanelModel.Confirmation?
     var route: SessionsPanelModel.Route = .main
     var awaitingNames: [NamingRecord] = []
@@ -294,6 +299,7 @@ private struct SessionsPanelPreview: View {
         model.elapsed = 736
         model.costEstimate = 0.11
         model.autoEndIn = autoEndIn
+        model.bleedWarning = bleedWarning
         model.settingsForm.load(from: state)
         // A plausible speech envelope rather than noise, so the bar scaling can
         // actually be judged.

@@ -39,6 +39,9 @@ Mic and meeting audio are recorded as **separate tracks**. Because your voice is
 on its own track you are always labelled correctly, and speaker separation only
 has to sort out the far end.
 
+Braid assumes headphones: on speakers it warns you while recording and cleans
+the far end's echo out of your track afterwards.
+
 **AssemblyAI** returns speaker labels already attached to the words, in one call.
 Doing it locally means aligning an unlabelled transcript against separate speaker
 segments, which goes wrong in ways that are hard to spot. Diarization adds about

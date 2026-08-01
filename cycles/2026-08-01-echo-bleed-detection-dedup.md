@@ -1,5 +1,5 @@
 # Echo bleed: detect and dedup
-status: ready
+status: verified
 created: 2026-08-01
 updated: 2026-08-01
 release: production
@@ -98,7 +98,56 @@ block; post-hoc warning reuses the R16 pattern.
 
 ## Result
 
-<!-- deliver -->
+Delivered 2026-08-01. All three checks pass; 63 tests green (6 new), build
+clean, geometry PANEL-GEOMETRY-OK, 14 snapshots.
+
+**What changed**
+
+- `EchoBleedDetector` (new, BraidCore/Capture): decimates both mono streams to
+  ~4 kHz in the IO path, correlates mic against remote over 0–100 ms lags in
+  1 s windows on a utility queue, mean-removed (a shared DC offset would
+  otherwise correlate at every lag — caught by the fixture during delivery and
+  hardened in the detector, not just the test). Confirmation needs two windows
+  agreeing on the lag within 5 ms and is sticky for the Session.
+- CaptureEngine: output-route prior (`kAudioDevicePropertyTransportType` +
+  `DataSource`; built-in speaker = likely, headphone jack clears it, Bluetooth
+  stays ambiguous by design) with a default-output listener for mid-Session
+  device changes; feeds the detector matched frames; `Result.bleedDetected`.
+- `Session.bleedDetected` (optional, decode-safe); set at Stop.
+- `Transcript.dedupingEchoes`: drops "Me" utterances that time-overlap a
+  Remote utterance (±0.5 s tolerance) with ≥60% token containment and ≥3
+  tokens; interruptions and short agreements survive. Applied in
+  `JobQueue.execute` only when the flag is set, before auto-assign.
+- Recording block shows the warning live (proof outranks prior); enqueue
+  emits `echoBleedWarning` → notification, mirroring the R16 pattern; CLI
+  prints it. README gained its one headphones sentence.
+
+**Checks**
+
+1. `detectorConfirmsADelayedCopyAndReportsTheLag` (15 ms echo at −16 dB →
+   confirmed, lag within 5 ms), `detectorNeverConfirmsIndependentSignals`.
+   Both deterministic (seeded noise). Pass.
+2. `dedupDropsTheEchoedLineAndKeepsTheInterruption`,
+   `dedupSparesShortLinesAndCleanTranscripts` (clean transcript returns
+   equal). Pass.
+3. `bleedFlagGatesDedupThroughTheWholePipeline` — flagged Session delivers
+   hands-off minus the echo with the warning event; identical unflagged
+   Session keeps its Mic Track intact. `panel-recording-bleed` snapshot shows
+   the in-recording warning. `detectorProcessesTenMinutesCheaply` is the R4
+   proxy (10 min of audio analysed in ≪5 s CPU); the in-call `top`
+   measurement remains owner-run, as R4 itself always has been.
+
+**Review** (self, against contracts): one real defect found and fixed during
+delivery — the original correlation was DC-sensitive; a positive-mean fixture
+confirmed spuriously at an arbitrary lag. Mean removal fixed it and the test
+fixture was centered to keep testing the correlation rather than the offset.
+No blocking findings remain.
+
+**Limitations within contract**: the 0.25 correlation threshold and the
+two-window rule are validated on synthetic fixtures; the cycle's stated
+unknown — behaviour on this MacBook's real speakers and room — needs one real
+speaker Session, which is exactly what iterate should look at. Bluetooth
+outputs never raise the device prior; the correlation alone carries those.
 
 ## Learning and next move
 

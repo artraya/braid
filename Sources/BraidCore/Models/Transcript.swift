@@ -96,6 +96,50 @@ public struct Transcript: Sendable, Codable, Equatable {
     /// Applies user-assigned names. Keys are current labels ("Speaker 1"),
     /// values the names to use. Unmapped and blank entries are left alone, and
     /// "Me" is never renamed (R11).
+    /// Removes Mic-Track echoes of Remote speech (echo cycle, layer 3).
+    ///
+    /// Speaker playback re-entering the mic puts the far end's words on both
+    /// Tracks; the merge then attributes the duplicate to "Me". An echo lags
+    /// its original by well under a second, so a "Me" utterance that
+    /// time-overlaps a Remote utterance *and* repeats its words is a duplicate,
+    /// not the user. Both conditions are required, so a genuine interruption
+    /// (overlapping, different words) and a genuine echoed agreement of fewer
+    /// than `minTokens` words ("yeah, exactly") always survive — conservative
+    /// by design, and callers only run this on Sessions where bleed was proved.
+    public func dedupingEchoes(minTokens: Int = 3,
+                               minSimilarity: Double = 0.6) -> (transcript: Transcript, dropped: Int) {
+        let remotes = utterances.filter { $0.speaker != "Me" }
+        guard !remotes.isEmpty else { return (self, 0) }
+        var dropped = 0
+        var copy = self
+        copy.utterances = utterances.filter { u in
+            guard u.speaker == "Me" else { return true }
+            let tokens = Self.tokens(u.text)
+            guard tokens.count >= minTokens else { return true }
+            let isEcho = remotes.contains { r in
+                // Overlap against the Remote utterance widened by half a
+                // second each way: provider timestamps are approximate.
+                let overlap = min(u.end, r.end + 0.5) - max(u.start, r.start - 0.5)
+                guard overlap >= 0.5 * max(0.1, u.end - u.start) else { return false }
+                let remoteTokens = Self.tokens(r.text)
+                guard !remoteTokens.isEmpty else { return false }
+                // Containment, not symmetric similarity: the echo is a partial,
+                // often mangled copy of the original, never a superset.
+                let contained = tokens.filter(remoteTokens.contains).count
+                return Double(contained) / Double(tokens.count) >= minSimilarity
+            }
+            if isEcho { dropped += 1 }
+            return !isEcho
+        }
+        return (copy, dropped)
+    }
+
+    static func tokens(_ text: String) -> Set<String> {
+        Set(text.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty })
+    }
+
     public func renamingSpeakers(_ names: [String: String]) -> Transcript {
         var copy = self
         copy.utterances = utterances.map { u in

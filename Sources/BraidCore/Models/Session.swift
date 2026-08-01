@@ -53,6 +53,10 @@ public struct Session: Sendable, Codable, Identifiable {
     /// Optional user-asserted speaker count for the Remote Track (amended R6).
     /// Optional so Sessions persisted before this field decode as Auto.
     public var expectedSpeakers: SpeakerExpectation?
+    /// Correlation-confirmed speaker bleed during this Session (echo cycle).
+    /// Optional so Sessions persisted before this field decode as "unknown",
+    /// which the pipeline treats as no dedup — never risk real speech.
+    public var bleedDetected: Bool?
     /// Wall-clock Start (filename uses this, local time — SPEC R9).
     public var startedAt: Date
     /// Recorded audio only, pauses excluded (SPEC R10).

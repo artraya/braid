@@ -133,6 +133,10 @@ final class AppState {
                             body: "Check the System Audio Recording permission. The note will only contain your side.")
         case .jobCancelled:
             break   // the user just asked for this; a notification would be noise
+        case .echoBleedWarning:
+            Notifier.notify(
+                title: "Recorded on speakers",
+                body: "The far end leaked into your mic. Duplicated lines will be removed — headphones avoid this next time.")
         case .speakersDetected(let job, let stats, let mismatch):
             refreshNamingState()
             let count = stats.count
@@ -337,6 +341,19 @@ final class AppState {
         catch { lastError = "\(error)" }
     }
 
+    /// The recording block's speaker-bleed line: correlation proof outranks
+    /// the device prior; silence when neither applies (echo cycle).
+    var bleedWarning: String? {
+        guard phase != .idle else { return nil }
+        if engine.bleedDetector.verdict.confirmed {
+            return "Speakers are bleeding into your mic — plug in headphones. Duplicates will be cleaned from the note."
+        }
+        if engine.speakerOutputLikely {
+            return "Playing through speakers — the far end may bleed into your mic. Headphones fix it."
+        }
+        return nil
+    }
+
     /// −50 dBFS (SPEC R16).
     static let silenceThreshold: Float = 0.00316
 
@@ -350,6 +367,7 @@ final class AppState {
                 Transcript.PauseMarker(atRecordedSeconds: $0.atRecordedSeconds,
                                        wallGapSeconds: $0.wallGapSeconds)
             }
+            session.bleedDetected = result.bleedDetected
             let silent = result.remotePeak < Self.silenceThreshold
             currentSession = nil
             recordingStartedAt = nil

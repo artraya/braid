@@ -354,6 +354,9 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
     let delay: Duration
     /// Speakers returned for the diarized (Remote) request.
     let remoteSpeakers: [String]
+    /// Explicit per-Track utterances, overriding the synthesized defaults.
+    let micUtterances: [Utterance]?
+    let remoteUtterances: [Utterance]?
     private let lock = NSLock()
     private var _calls: [Call] = []
     var calls: Int { lock.withLock { _calls.count } }
@@ -362,9 +365,12 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
     /// cancels before the work is under way.
     let started = AsyncStream<Void>.makeStream()
 
-    init(delay: Duration = .milliseconds(50), remoteSpeakers: [String] = ["A"]) {
+    init(delay: Duration = .milliseconds(50), remoteSpeakers: [String] = ["A"],
+         micUtterances: [Utterance]? = nil, remoteUtterances: [Utterance]? = nil) {
         self.delay = delay
         self.remoteSpeakers = remoteSpeakers
+        self.micUtterances = micUtterances
+        self.remoteUtterances = remoteUtterances
     }
 
     func transcribe(track: URL, diarize: Bool, keyTerms: [String],
@@ -376,8 +382,9 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
         started.continuation.yield()
         try await Task.sleep(for: delay)
         guard diarize else {
-            return [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
+            return micUtterances ?? [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
         }
+        if let remoteUtterances { return remoteUtterances }
         return remoteSpeakers.enumerated().map { index, speaker in
             Utterance(speaker: speaker, start: Double(index) * 2 + 2,
                       end: Double(index) * 2 + 3, text: "line \(index)")
@@ -640,10 +647,12 @@ private func makeQueueEnvironment(provider: STTProvider, root: URL,
 
 /// Runs a Job to completion and returns everything the assertions need.
 private func runFixtureJob(
-    session: Session, remoteSpeakers: [String], root: URL
+    session: Session, remoteSpeakers: [String] = ["A"], root: URL,
+    provider explicitProvider: SpyProvider? = nil
 ) async throws -> (noteURL: URL, events: [JobQueue.Event],
                    summariser: StubSummariser, record: NamingRecord?) {
-    let provider = SpyProvider(delay: .milliseconds(1), remoteSpeakers: remoteSpeakers)
+    let provider = explicitProvider
+        ?? SpyProvider(delay: .milliseconds(1), remoteSpeakers: remoteSpeakers)
     let summariser = StubSummariser()
     let events = Mutex<[JobQueue.Event]>([])
     let done = AsyncStream<URL>.makeStream()
@@ -717,6 +726,188 @@ private func runFixtureJob(
     #expect(!record.namesApplied)
     #expect(run.events.contains { if case .speakersDetected = $0 { return true }
                                   return false })
+}
+
+// MARK: - Echo bleed detection (echo cycle, layer 0)
+
+/// Deterministic noise, so detector tests cannot flake.
+private struct SeededNoise {
+    var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> Float {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        // Centered on zero, like real audio: a DC offset in the fixture would
+        // test the mean removal, not the correlation.
+        return Float(Int64(truncatingIfNeeded: state >> 33)) / Float(Int64.max >> 33) - 0.5
+    }
+    mutating func samples(_ count: Int, amplitude: Float = 0.3) -> [Float] {
+        (0..<count).map { _ in next() * amplitude }
+    }
+}
+
+@Test func detectorConfirmsADelayedCopyAndReportsTheLag() {
+    let detector = EchoBleedDetector()
+    detector.configure(sampleRate: EchoBleedDetector.analysisRate)   // stride 1
+
+    // The mic hears the remote 15 ms later at a fraction of the level, plus
+    // its own independent room noise.
+    let delaySamples = 60   // 15 ms at 4 kHz
+    var far = SeededNoise(seed: 42)
+    var room = SeededNoise(seed: 7)
+    let total = 3 * EchoBleedDetector.windowSize
+    let remote = far.samples(total + delaySamples)
+    let mic = (0..<total).map { i in
+        remote[i] * 0.15 + room.next() * 0.02
+    }
+    // The remote the detector sees is aligned with the mic (shared clock):
+    // mic[t] contains remote[t - delay].
+    let alignedRemote = Array(remote[delaySamples..<(total + delaySamples)])
+
+    mic.withUnsafeBufferPointer { m in
+        alignedRemote.withUnsafeBufferPointer { r in
+            detector.pushAsync(mic: m.baseAddress!, remote: r.baseAddress!, frames: total)
+        }
+    }
+    detector.waitForPendingAnalysis()
+
+    let verdict = detector.verdict
+    #expect(verdict.confirmed)
+    #expect(abs((verdict.lagMilliseconds ?? 0) - 15.0) <= EchoBleedDetector.lagToleranceMs)
+}
+
+@Test func detectorNeverConfirmsIndependentSignals() {
+    let detector = EchoBleedDetector()
+    detector.configure(sampleRate: EchoBleedDetector.analysisRate)
+
+    var far = SeededNoise(seed: 1)
+    var near = SeededNoise(seed: 999)
+    let total = 4 * EchoBleedDetector.windowSize
+    let remote = far.samples(total)
+    let mic = near.samples(total)
+
+    mic.withUnsafeBufferPointer { m in
+        remote.withUnsafeBufferPointer { r in
+            detector.pushAsync(mic: m.baseAddress!, remote: r.baseAddress!, frames: total)
+        }
+    }
+    detector.waitForPendingAnalysis()
+    #expect(!detector.verdict.confirmed)
+}
+
+/// R4 proxy: ten minutes of unconfirmable audio through the detector must cost
+/// a trivial amount of CPU. The real in-call measurement stays owner-run.
+@Test func detectorProcessesTenMinutesCheaply() {
+    let detector = EchoBleedDetector()
+    detector.configure(sampleRate: 16_000)   // stride 4, as recorded
+
+    var far = SeededNoise(seed: 3)
+    var near = SeededNoise(seed: 4)
+    let chunk = 16_000   // one second at a time, as the IOProc would
+    let start = Date()
+    for _ in 0..<600 {
+        let remote = far.samples(chunk)
+        let mic = near.samples(chunk)
+        mic.withUnsafeBufferPointer { m in
+            remote.withUnsafeBufferPointer { r in
+                detector.pushAsync(mic: m.baseAddress!, remote: r.baseAddress!, frames: chunk)
+            }
+        }
+    }
+    detector.waitForPendingAnalysis()
+    let elapsed = Date().timeIntervalSince(start)
+    #expect(!detector.verdict.confirmed)
+    #expect(elapsed < 5.0, "10 minutes of audio took \(elapsed)s to analyse")
+}
+
+// MARK: - Echo dedup (echo cycle, layer 3)
+
+private let echoedRemote = Utterance(
+    speaker: "Speaker 1", start: 10, end: 14,
+    text: "We looked at the slope data over the weekend and it settled")
+
+@Test func dedupDropsTheEchoedLineAndKeepsTheInterruption() {
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Me", start: 2, end: 4, text: "Morning, thanks for joining"),
+        echoedRemote,
+        // The echo: same words, overlapping, attributed to Me by the merge.
+        Utterance(speaker: "Me", start: 10.2, end: 14.1,
+                  text: "we looked at the slope data over the weekend and it settled"),
+        // A genuine interruption: overlapping, different words. Survives.
+        Utterance(speaker: "Me", start: 12, end: 13.5,
+                  text: "sorry which sensor was that"),
+        Utterance(speaker: "Speaker 1", start: 15, end: 16, text: "the upper array"),
+    ])
+    let (deduped, dropped) = t.dedupingEchoes()
+    #expect(dropped == 1)
+    #expect(deduped.utterances.map(\.text) == [
+        "Morning, thanks for joining",
+        echoedRemote.text,
+        "sorry which sensor was that",
+        "the upper array",
+    ])
+}
+
+@Test func dedupSparesShortLinesAndCleanTranscripts() {
+    // "yeah exactly" matches remote words and overlaps, but two tokens is
+    // below the floor: dropping genuine agreement is worse than an echo of it.
+    let t = Transcript(utterances: [
+        Utterance(speaker: "Speaker 1", start: 0, end: 3, text: "so yeah exactly as planned"),
+        Utterance(speaker: "Me", start: 1, end: 2, text: "yeah exactly"),
+    ])
+    let (deduped, dropped) = t.dedupingEchoes()
+    #expect(dropped == 0)
+    #expect(deduped == t)
+
+    // A transcript with no echoes passes through identical.
+    let clean = Transcript(utterances: [
+        Utterance(speaker: "Me", start: 0, end: 2, text: "how did the install go"),
+        Utterance(speaker: "Speaker 1", start: 3, end: 6, text: "two sensors are in and logging"),
+    ])
+    let (untouched, none) = clean.dedupingEchoes()
+    #expect(none == 0)
+    #expect(untouched == clean)
+}
+
+/// End to end: a flagged Session delivers hands-off with the echo gone; the
+/// identical unflagged Session keeps its Mic Track untouched (the gate).
+@Test func bleedFlagGatesDedupThroughTheWholePipeline() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("bleed-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func spy() -> SpyProvider {
+        SpyProvider(
+            delay: .milliseconds(1),
+            micUtterances: [
+                Utterance(speaker: "A", start: 2, end: 4, text: "Morning, thanks for joining"),
+                Utterance(speaker: "A", start: 10.2, end: 14.1,
+                          text: "we looked at the slope data over the weekend and it settled"),
+            ],
+            remoteUtterances: [echoedRemote])
+    }
+
+    var flagged = Session(title: "Speakers", presetName: "Meeting", participants: [],
+                          startedAt: Date(), recordedDuration: 60)
+    flagged.bleedDetected = true
+    let flaggedRun = try await runFixtureJob(session: flagged, root: root, provider: spy())
+    let flaggedTexts = try #require(flaggedRun.summariser.transcripts.first)
+        .utterances.filter { $0.speaker == "Me" }.map(\.text)
+    #expect(flaggedTexts == ["Morning, thanks for joining"])
+    #expect(flaggedRun.events.contains {
+        if case .echoBleedWarning = $0 { return true }
+        return false
+    })
+
+    let unflagged = Session(title: "Headphones", presetName: "Meeting", participants: [],
+                            startedAt: Date(), recordedDuration: 60)
+    let unflaggedRun = try await runFixtureJob(session: unflagged, root: root, provider: spy())
+    let unflaggedTexts = try #require(unflaggedRun.summariser.transcripts.first)
+        .utterances.filter { $0.speaker == "Me" }.map(\.text)
+    #expect(unflaggedTexts.count == 2)
+    #expect(!unflaggedRun.events.contains {
+        if case .echoBleedWarning = $0 { return true }
+        return false
+    })
 }
 
 // MARK: - Auto-end detection

@@ -91,6 +91,14 @@ struct RecordingSection: View {
                 autoEndBanner(seconds)
             }
             statusLine
+            if let warning = model.bleedWarning {
+                Label(warning, systemImage: "speaker.wave.2.bubble")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
             Text(Format.clock(model.elapsed))
                 .font(.system(size: 36, weight: .bold, design: .rounded))
                 .monospacedDigit()

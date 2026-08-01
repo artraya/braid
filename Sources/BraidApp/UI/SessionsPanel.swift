@@ -46,6 +46,8 @@ final class SessionsPanelModel {
     var costEstimate: Double = 0
     /// Seconds until the Session stops by itself, or nil when nothing is pending.
     var autoEndIn: Int?
+    /// Speaker-bleed line in the recording block, nil when all is well.
+    var bleedWarning: String?
 
     /// An irreversible action waiting on a yes or no, shown inline rather than
     /// as an alert box — an alert would be exactly the extra window the panel
@@ -223,6 +225,7 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
         }
         model.levels = state.engine.levels.recent(Self.barCount)
         model.costEstimate = state.liveCostEstimate
+        model.bleedWarning = state.bleedWarning
         if let startedAt = state.recordingStartedAt, state.phase == .recording {
             model.elapsed = Date().timeIntervalSince(startedAt)
         }

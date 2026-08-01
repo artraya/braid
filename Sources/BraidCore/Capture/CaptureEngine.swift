@@ -24,6 +24,9 @@ public final class CaptureEngine: @unchecked Sendable {
         /// Peak absolute sample observed on the Remote Track (for R16).
         public let remotePeak: Float
         public let micPeak: Float
+        /// Correlation-confirmed speaker bleed (echo cycle): the far end
+        /// audibly re-entered the mic during this Session.
+        public let bleedDetected: Bool
     }
 
     public enum State: String, Sendable { case idle, recording, paused }
@@ -43,6 +46,13 @@ public final class CaptureEngine: @unchecked Sendable {
     private var remoteURL: URL?
     /// Live peaks for the recording HUD's waveform.
     public let levels = LevelMeter()
+    /// Correlation proof of speaker bleed; the panel reads its verdict live.
+    public let bleedDetector = EchoBleedDetector()
+    /// Device prior: the default output is the built-in speaker (not proof —
+    /// AirPods and a HomePod both read as Bluetooth — but a strong hint).
+    public var speakerOutputLikely: Bool { stateLock.withLock { _speakerOutputLikely } }
+    private var _speakerOutputLikely = false
+    private var outputListener: AudioObjectPropertyListenerBlock?
 
     // Written only inside the IOProc / state transitions.
     private var paused = false  // read by IOProc (word-sized read; transitions hold no lock in the RT path)
@@ -124,7 +134,8 @@ public final class CaptureEngine: @unchecked Sendable {
             micURL: micURL!, remoteURL: remoteURL!,
             recordedDuration: duration,
             pauseSpans: pauseSpans,
-            remotePeak: remotePeak, micPeak: micPeak)
+            remotePeak: remotePeak, micPeak: micPeak,
+            bleedDetected: bleedDetector.verdict.confirmed)
     }
 
     // MARK: - Core Audio setup
@@ -163,6 +174,9 @@ public final class CaptureEngine: @unchecked Sendable {
 
         let rate = try Self.nominalSampleRate(of: aggregateID)
         levels.configure(sampleRate: rate)
+        bleedDetector.configure(sampleRate: rate)
+        refreshOutputRoute()
+        startOutputListener()
         let micURL = directory.appendingPathComponent("mic.caf")
         let remoteURL = directory.appendingPathComponent("remote.caf")
         self.micURL = micURL
@@ -189,6 +203,7 @@ public final class CaptureEngine: @unchecked Sendable {
         // the user and the far end.
         var callbackPeak: Float = 0
         var callbackFrames = 0
+        var remoteFrames = 0
 
         for (index, buffer) in abl.enumerated() {
             guard let data = buffer.mData else { continue }
@@ -221,14 +236,96 @@ public final class CaptureEngine: @unchecked Sendable {
             }
             if isMic { micScratch = scratch } else { remoteScratch = scratch }
             if peak > callbackPeak { callbackPeak = peak }
-            if isMic { callbackFrames = n }
+            if isMic { callbackFrames = n } else { remoteFrames = max(remoteFrames, n) }
         }
         if callbackFrames > 0 {
             levels.push(peak: callbackPeak, frames: callbackFrames)
         }
+        // Feed the bleed detector matched mono frames; it decimates, copies
+        // and returns, and analyses on its own utility queue.
+        if callbackFrames > 0, remoteFrames > 0 {
+            let n = min(callbackFrames, remoteFrames)
+            micScratch.withUnsafeBufferPointer { mic in
+                remoteScratch.withUnsafeBufferPointer { remote in
+                    bleedDetector.pushAsync(mic: mic.baseAddress!,
+                                            remote: remote.baseAddress!, frames: n)
+                }
+            }
+        }
+    }
+
+    // MARK: - Output route (speaker prior)
+
+    /// True when the default output is the built-in speaker — the one case
+    /// the hardware states outright. Headphone jack, USB, HDMI and Bluetooth
+    /// all clear it; Bluetooth stays ambiguous by design (research note), and
+    /// the correlation carries the proof there.
+    static func defaultOutputIsBuiltInSpeaker() -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID) == noErr,
+            deviceID != kAudioObjectUnknown else { return false }
+
+        addr.mSelector = kAudioDevicePropertyTransportType
+        var transport: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &transport) == noErr,
+              transport == kAudioDeviceTransportTypeBuiltIn else { return false }
+
+        // Built-in output: the data source says speaker ('ispk') or headphone
+        // jack ('hdpn'). Unreadable defaults to speaker — the safe warning.
+        addr.mSelector = kAudioDevicePropertyDataSource
+        addr.mScope = kAudioObjectPropertyScopeOutput
+        var source: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &source) == noErr else {
+            return true
+        }
+        return source != 0x6864_706E   // 'hdpn'
+    }
+
+    private func refreshOutputRoute() {
+        let speaker = Self.defaultOutputIsBuiltInSpeaker()
+        stateLock.withLock { _speakerOutputLikely = speaker }
+        if speaker {
+            log.notice("default output is the built-in speaker — bleed likely without headphones")
+        }
+    }
+
+    /// Re-evaluates the prior when the default output changes mid-Session —
+    /// the realistic failure is AirPods dying forty minutes in.
+    private func startOutputListener() {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.refreshOutputRoute()
+        }
+        if AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, nil, block) == noErr {
+            outputListener = block
+        }
+    }
+
+    private func stopOutputListener() {
+        guard let block = outputListener else { return }
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr, nil, block)
+        outputListener = nil
     }
 
     private func teardownCoreAudio() {
+        stopOutputListener()
         keepAlive.stop()
         if let procID, aggregateID != kAudioObjectUnknown {
             AudioDeviceStop(aggregateID, procID)

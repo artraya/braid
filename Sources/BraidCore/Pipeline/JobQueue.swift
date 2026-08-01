@@ -78,6 +78,9 @@ public actor JobQueue {
         /// may want to put names to, and any heard-vs-expected disagreement.
         case speakersDetected(Job, [Transcript.SpeakerStat], Session.SpeakerCountMismatch?)
         case jobCancelled(Job)
+        /// The Session was recorded with confirmed speaker bleed; echoes will
+        /// be cleaned from the Mic Track (echo cycle).
+        case echoBleedWarning(Job)
     }
 
     let log = Logger(subsystem: "no.braid.app", category: "pipeline")
@@ -124,6 +127,10 @@ public actor JobQueue {
         if remoteSilent {
             env.onEvent(.remoteSilentWarning(job))
             log.warning("no system audio captured for \(job.id, privacy: .public) — check permission (R16)")
+        }
+        if session.bleedDetected == true {
+            env.onEvent(.echoBleedWarning(job))
+            log.warning("speaker bleed confirmed for \(job.id, privacy: .public) — echoes will be cleaned from the Mic Track")
         }
         job.status = .queued
         jobs[job.id] = job
@@ -298,6 +305,17 @@ public actor JobQueue {
         var transcript = mergeTranscripts(
             mic: micUtterances, remote: remoteUtterances,
             pauseSpans: job.session.pauseSpans)
+
+        // Echo cycle, layer 3: only a Session with correlation-proved bleed is
+        // deduped — no proof, no risk to real speech. Runs before auto-assign
+        // so the remaining voices are the real ones.
+        if job.session.bleedDetected == true {
+            let (deduped, dropped) = transcript.dedupingEchoes()
+            transcript = deduped
+            if dropped > 0 {
+                log.notice("echo dedup for \(job.id, privacy: .public): dropped \(dropped) duplicated Mic utterance\(dropped == 1 ? "" : "s")")
+            }
+        }
 
         // R6a (amended 2026-08-01): exactly one declared Participant and
         // exactly one heard voice is unambiguous, so the voice is named before
