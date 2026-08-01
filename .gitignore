@@ -11,11 +11,5 @@ dist/
 Resources/AppIcon.icns
 *.o
 
-# Internal working documents, kept locally
-IDEA.md
-SPEC.md
-CONTEXT.md
-MORNING.md
-
 # macOS
 .DS_Store
