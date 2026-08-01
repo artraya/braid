@@ -1,5 +1,5 @@
 # Speaker attribution
-status: verified
+status: shipped
 created: 2026-08-01
 updated: 2026-08-01
 release: production
@@ -162,15 +162,11 @@ gently); under-splitting remains unfixable post hoc by design (R7).
 
 ## Release
 
-Owner chose commit-only (2026-08-01). Committed to main as `49a3653` (docs
-baseline `11e326f`). Production install pending, owner-run:
-
-    ./scripts/build-app.sh          # sign with the local identity
-    zip -r ~/Braid-v0.2.0-rollback.zip /Applications/Braid.app   # rollback
-    cp -R dist/Braid.app /Applications/
-
-Then tag the installed version per SPEC Operation. First launch shows one
-Keychain "Always Allow" prompt. Status stays `verified` until installed.
+Shipped 2026-08-01. Committed to main as `49a3653` (docs baseline `11e326f`),
+tagged `v0.3.0`. Owner ran the build and install; smoke check: installed
+binary hash matches the build (`826690df…`), signature valid, app relaunched
+from /Applications and stable. Rollback: `~/Braid-v0.2.0-rollback.zip`
+(previous installed version, zipped before replacement).
 
 ## Learning and next move
 
