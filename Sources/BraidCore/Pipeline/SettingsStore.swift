@@ -61,6 +61,35 @@ public struct SettingsStore: Sendable {
         nonmutating set { defaults.set(newValue, forKey: "callAppBundleIDs") }
     }
 
+    /// Where transcription happens. Auto once local is installed: it costs
+    /// nothing, keeps the audio here, and needs no decision from the user —
+    /// which is the whole point of the app.
+    public var providerMode: ProviderMode {
+        get {
+            guard let raw = defaults.string(forKey: "providerMode"),
+                  let mode = ProviderMode(rawValue: raw) else { return .cloud }
+            return mode
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: "providerMode") }
+    }
+
+    /// Which on-device engine runs in Local and Auto modes.
+    public var localEngine: LocalEngine {
+        get {
+            guard let raw = defaults.string(forKey: "localEngine"),
+                  let engine = LocalEngine(rawValue: raw) else { return .parakeet }
+            return engine
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: "localEngine") }
+    }
+
+    /// Set once the local models are downloaded and loaded at least once, so
+    /// the app knows whether choosing Local means a wait.
+    public var localModelsInstalled: Bool {
+        get { defaults.bool(forKey: "localModelsInstalled") }
+        nonmutating set { defaults.set(newValue, forKey: "localModelsInstalled") }
+    }
+
     /// Running cost total in USD (SPEC R14).
     public var costTotalUSD: Double {
         get { defaults.double(forKey: "costTotalUSD") }

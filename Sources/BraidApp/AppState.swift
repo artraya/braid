@@ -22,6 +22,10 @@ final class AppState {
     /// Cancelled but still holding their Recording, awaiting process or delete.
     var cancelledJobs: [BraidCore.Job] = [] { didSet { onChange?() } }
     var lastError: String? { didSet { onChange?() } }
+    /// Why the local models could not be prepared, shown in Settings. Separate
+    /// from `lastError`, which drives the menu-bar error state: a model that
+    /// has not downloaded yet is a setup step, not a failed recording.
+    var localModelError: String? { didSet { onChange?() } }
     var currentTitle = ""
     var recordingStartedAt: Date?
     let settings: SettingsStore
@@ -75,9 +79,57 @@ final class AppState {
 
     var setupComplete: Bool { keysConfigured && settings.vaultPath != nil }
 
+    /// The Anthropic key is always needed — the Summariser writes the Note and
+    /// stays in the cloud. The AssemblyAI key is only needed when transcription
+    /// actually goes there: on this Mac, setup is one key, not two.
     func refreshKeyState() {
-        keysConfigured = settings.keychain.get(.assemblyAI) != nil
-            && settings.keychain.get(.anthropic) != nil
+        let anthropic = settings.keychain.get(.anthropic) != nil
+        let assemblyAI = settings.keychain.get(.assemblyAI) != nil
+        keysConfigured = anthropic && (settings.providerMode == .cloud ? assemblyAI : true)
+    }
+
+    /// Primary and fallback for the current mode.
+    ///
+    /// Local mode returns no fallback at all, which is what makes its promise
+    /// structural rather than a policy someone could later forget: with no
+    /// cloud Provider in the Environment there is nothing for a failure to
+    /// reach. Auto without an AssemblyAI key is simply local.
+    private func providers() -> (primary: STTProvider, fallback: STTProvider?)? {
+        let cloud = settings.keychain.get(.assemblyAI).map { AssemblyAIAdapter(apiKey: $0) }
+        switch settings.providerMode {
+        case .cloud:
+            guard let cloud else { return nil }
+            return (cloud, nil)
+        case .local:
+            return (LocalAdapter.make(engine: settings.localEngine), nil)
+        case .auto:
+            return (LocalAdapter.make(engine: settings.localEngine), cloud)
+        }
+    }
+
+    /// Applies a Provider-mode or engine change to the running queue.
+    func applyProviderSettings() {
+        refreshKeyState()
+        guard let queue, let picked = providers() else { return }
+        Task { await queue.updateProviders(primary: picked.primary, fallback: picked.fallback) }
+    }
+
+    /// Downloads and loads the local models so the first Session after
+    /// switching does not stall. Safe to call repeatedly.
+    func prepareLocalModels() {
+        let engine = settings.localEngine
+        let settings = self.settings
+        Task {
+            do {
+                try await LocalAdapter.make(engine: engine).prepare()
+                await MainActor.run {
+                    settings.localModelsInstalled = true
+                    self.localModelError = nil
+                }
+            } catch {
+                await MainActor.run { self.localModelError = "\(error)" }
+            }
+        }
     }
 
     // MARK: - Lifecycle
@@ -85,11 +137,12 @@ final class AppState {
     func bootstrap() {
         refreshKeyState()
         guard queue == nil else { return }
-        guard let sttKey = settings.keychain.get(.assemblyAI),
-              let claudeKey = settings.keychain.get(.anthropic) else { return }
+        guard let claudeKey = settings.keychain.get(.anthropic),
+              let picked = providers() else { return }
         let summariser = Summariser(apiKey: claudeKey)
         let env = JobQueue.Environment(
-            provider: AssemblyAIAdapter(apiKey: sttKey),
+            provider: picked.primary,
+            fallback: picked.fallback,
             summariser: summariser,
             settings: settings,
             transcripts: transcripts,
@@ -137,6 +190,12 @@ final class AppState {
             Notifier.notify(
                 title: "Recorded on speakers",
                 body: "The far end leaked into your mic. Duplicated lines will be removed — headphones avoid this next time.")
+        case .providerFellBack(_, from: _, to: let to, reason: _):
+            // Audio going somewhere the user did not expect is never a silent
+            // event, even though the Note still arrives.
+            Notifier.notify(
+                title: "Transcribed in the cloud instead",
+                body: "On-device transcription failed, so this recording went to \(to). The note says so too.")
         case .speakersDetected(let job, let stats, let mismatch):
             refreshNamingState()
             let count = stats.count
@@ -267,6 +326,10 @@ final class AppState {
             recordingStartedAt = session.startedAt
             lastError = nil
             phase = .recording
+            // Hold back local inference for the duration: capture has R4's
+            // 100MB budget to itself, and the models peak far above it.
+            let queue = self.queue
+            Task { await queue?.setRecordingActive(true) }
             startCallWatcher()
         } catch {
             lastError = "Could not start recording: \(error)"
@@ -374,6 +437,9 @@ final class AppState {
             phase = .idle
             let queue = self.queue
             Task {
+                // Releases anything held back during the recording, then adds
+                // this Session behind it.
+                await queue?.setRecordingActive(false)
                 await queue?.enqueue(session: session, remoteSilent: silent)
                 await self.refreshJobState()
             }
@@ -397,6 +463,10 @@ final class AppState {
         currentTitle = ""
         phase = .idle
         try? FileManager.default.removeItem(at: dir)
+        // Nothing is queued for this Session, but earlier Jobs held back for
+        // the recording are free to run again.
+        let queue = self.queue
+        Task { await queue?.setRecordingActive(false) }
     }
 
     func retry(jobID: String) {

@@ -4,12 +4,26 @@ import os
 /// The Provider abstraction: submits a Recording, returns per-Track utterances.
 public protocol STTProvider: Sendable {
     var name: String { get }
+    /// Whether this Provider wants the compressed copy. Cloud Adapters do —
+    /// FLAC is a fraction of the upload. Local engines read the CAF originals,
+    /// so transcoding for them would be pure waste.
+    var prefersCompressedUpload: Bool { get }
+    /// Whether transcription happens on this machine. Decides both that no
+    /// audio leaves and that no per-audio-hour STT cost is incurred (R14).
+    var isLocal: Bool { get }
     /// Transcribes one Track. `diarize: false` returns a single unlabelled
     /// speaker stream (the Adapter's caller labels the Mic Track "Me").
     /// `expectedSpeakers` is honoured only when diarizing, and only because the
     /// user asserted it at Start (amended R6): see `requestBody`.
     func transcribe(track: URL, diarize: Bool, keyTerms: [String],
                     expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance]
+}
+
+extension STTProvider {
+    // Defaults describe the cloud, which is what every Provider was until
+    // local arrived — so existing Adapters and test doubles need no changes.
+    public var prefersCompressedUpload: Bool { true }
+    public var isLocal: Bool { false }
 }
 
 /// AssemblyAI universal-3-5-pro (SPEC Architecture). Quirks owned here:

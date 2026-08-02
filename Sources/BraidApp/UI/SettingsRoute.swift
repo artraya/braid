@@ -17,6 +17,8 @@ final class SettingsFormModel {
     var callApps = ""
     var presets: [Preset] = []
     var editingPreset = ""
+    var providerMode: ProviderMode = .cloud
+    var localEngine: LocalEngine = .parakeet
 
     var editingPromptIndex: Int? {
         presets.firstIndex { $0.name == editingPreset }
@@ -36,6 +38,8 @@ final class SettingsFormModel {
         callApps = settings.callAppBundleIDs.joined(separator: "\n")
         presets = settings.presets
         editingPreset = presets.first?.name ?? ""
+        providerMode = settings.providerMode
+        localEngine = settings.localEngine
     }
 
     func save(to state: AppState) {
@@ -56,6 +60,15 @@ final class SettingsFormModel {
         let apps = lines(callApps)
         if !apps.isEmpty { settings.callAppBundleIDs = apps }
         settings.presets = presets
+        let providerChanged = settings.providerMode != providerMode
+            || settings.localEngine != localEngine
+        settings.providerMode = providerMode
+        settings.localEngine = localEngine
+        if providerChanged {
+            state.applyProviderSettings()
+            // Fetch the models now rather than making the next Session wait.
+            if providerMode != .cloud { state.prepareLocalModels() }
+        }
     }
 
     private func lines(_ text: String) -> [String] {
@@ -87,6 +100,7 @@ struct SettingsRoute: View {
                     // (amended R18); cap warnings still notify on their own.
                     UsageCard(usage: state.usage)
                     vault
+                    transcription
                     keys
                     keyTerms
                     budget
@@ -126,6 +140,50 @@ struct SettingsRoute: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Theme.accent)
             }
+        }
+    }
+
+    private var transcription: some View {
+        Field("Transcription", note: transcriptionNote) {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("", selection: binding(\.providerMode)) {
+                    ForEach(ProviderMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .font(.system(size: 11))
+
+                if form.providerMode != .cloud {
+                    Picker("", selection: binding(\.localEngine)) {
+                        ForEach(LocalEngine.allCases, id: \.self) { engine in
+                            Text(engine.label).tag(engine)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .font(.system(size: 11))
+
+                    if let error = state.localModelError {
+                        Text(error)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.orange)
+                            .lineLimit(3)
+                    }
+                }
+            }
+        }
+    }
+
+    private var transcriptionNote: String {
+        switch form.providerMode {
+        case .cloud:
+            "AssemblyAI. About $0.54 an hour, and the audio leaves this Mac."
+        case .local:
+            "On this Mac only. Free, nothing uploaded, and a failure waits for you rather than falling back."
+        case .auto:
+            "On this Mac, falling back to AssemblyAI if that fails. The note always says which ran."
         }
     }
 

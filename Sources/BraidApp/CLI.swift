@@ -30,6 +30,33 @@ if args.contains("--ui-preview") {
     MainActor.assumeIsolated { UIPreview.run(snapshotDirectory: directory) }
 }
 
+if let i = args.firstIndex(of: "--local-check") {
+    // --local-check <audio> [--reference <json>] [--engine parakeet|apple]
+    guard args.count > i + 1 else {
+        eprintLine("usage: --local-check <audio> [--reference <json>] [--engine parakeet|apple]")
+        exit(2)
+    }
+    let audio = URL(fileURLWithPath: args[i + 1])
+    let reference = args.firstIndex(of: "--reference").flatMap { r in
+        args.count > r + 1 ? URL(fileURLWithPath: args[r + 1]) : nil
+    }
+    let engine = args.firstIndex(of: "--engine")
+        .flatMap { e in args.count > e + 1 ? LocalEngine(rawValue: args[e + 1]) : nil } ?? .parakeet
+    let minTurn = args.firstIndex(of: "--min-turn")
+        .flatMap { m in args.count > m + 1 ? Double(args[m + 1]) : nil } ?? 1.0
+    let step = args.firstIndex(of: "--step")
+        .flatMap { s in args.count > s + 1 ? Double(args[s + 1]) : nil } ?? 0.2
+    let semaphore = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var code: Int32 = 1
+    Task {
+        code = await LocalCheck.run(audio: audio, reference: reference, engine: engine,
+                                    minTurn: minTurn, step: step)
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(code)
+}
+
 if let i = args.firstIndex(of: "--record-test") {
     // --record-test <dir> <seconds> [--pause <at> <for>]
     guard args.count > i + 2, let seconds = Double(args[i + 2]) else {
@@ -182,6 +209,8 @@ if let i = args.firstIndex(of: "--process-test") {
                 print("WARNING: remote track silent (R16)")
             case .echoBleedWarning:
                 print("WARNING: speaker bleed confirmed — echoes will be cleaned")
+            case .providerFellBack(_, let from, let to, let reason):
+                print("WARNING: \(from) failed, fell back to \(to): \(reason)")
             case .jobCancelled(let job):
                 print("job cancelled: \(job.id)")
             case .speakersDetected(_, let stats, let mismatch):

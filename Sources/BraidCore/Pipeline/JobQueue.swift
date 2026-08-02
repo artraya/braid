@@ -43,6 +43,13 @@ public actor JobQueue {
 
     public struct Environment: Sendable {
         public var provider: STTProvider
+        /// Tried once if `provider` fails, and only if the mode allows it.
+        ///
+        /// Routing policy lives in the app, which knows the user's setting;
+        /// the queue only knows there may be a second thing to try. In Cloud
+        /// and Local modes this is nil, which is what makes Local mode's
+        /// promise absolute: there is no cloud Provider here to fall back to.
+        public var fallback: STTProvider?
         public var summariser: any NoteSummarising
         public var settings: SettingsStore
         public var costTable: CostTable
@@ -52,13 +59,15 @@ public actor JobQueue {
         /// Called on status changes so the UI can react (icon state, notifications).
         public var onEvent: @Sendable (Event) -> Void
 
-        public init(provider: STTProvider, summariser: any NoteSummarising, settings: SettingsStore,
+        public init(provider: STTProvider, fallback: STTProvider? = nil,
+                    summariser: any NoteSummarising, settings: SettingsStore,
                     costTable: CostTable = .current,
                     jobsRoot: URL = JobQueue.appSupportURL.appendingPathComponent("jobs"),
                     transcripts: TranscriptStore = TranscriptStore(),
                     sessions: SessionIndex = SessionIndex(),
                     onEvent: @escaping @Sendable (Event) -> Void = { _ in }) {
             self.provider = provider
+            self.fallback = fallback
             self.summariser = summariser
             self.settings = settings
             self.costTable = costTable
@@ -81,12 +90,23 @@ public actor JobQueue {
         /// The Session was recorded with confirmed speaker bleed; echoes will
         /// be cleaned from the Mic Track (echo cycle).
         case echoBleedWarning(Job)
+        /// Local transcription failed and the cloud Provider took over. Always
+        /// surfaced: audio leaving the machine when the user expected it not to
+        /// is exactly the thing that must never happen quietly.
+        case providerFellBack(Job, from: String, to: String, reason: String)
     }
 
     let log = Logger(subsystem: "no.braid.app", category: "pipeline")
     var env: Environment
     var jobs: [String: Job] = [:]
     var runnerActive = false
+    /// True while a Session is being recorded. Local inference is held back
+    /// until Stop: the models peak in the hundreds of MB, and R4 budgets 100MB
+    /// for the whole app during a call on an 8GB machine. This is the
+    /// condition ADR-0005 leans on when it argues the 8GB constraint does not
+    /// apply to local ML — so it has to actually hold. Cloud Jobs are just
+    /// network and keep running.
+    var recordingActive = false
     /// The Job currently in flight, held so it can be cancelled mid-upload.
     var currentJobID: String?
     var currentTask: Task<URL, Error>?
@@ -185,6 +205,18 @@ public actor JobQueue {
         log.notice("job \(job.id, privacy: .public) discarded, recording deleted")
     }
 
+    /// Swaps the Providers after a settings change. Takes effect for the next
+    /// Job; one already in flight finishes on the Provider it started with,
+    /// so a Note is never assembled from two different sources.
+    public func updateProviders(primary: STTProvider, fallback: STTProvider?) {
+        env.provider = primary
+        env.fallback = fallback
+        log.notice("""
+            providers set: \(primary.name, privacy: .public)\
+            \(fallback.map { " with fallback \($0.name)" } ?? "", privacy: .public)
+            """)
+    }
+
     public func allJobs() -> [Job] { Array(jobs.values) }
     public func failedJobs() -> [Job] { jobs.values.filter { $0.status == .failed } }
     public func cancelledJobs() -> [Job] { jobs.values.filter { $0.status == .cancelled } }
@@ -204,9 +236,26 @@ public actor JobQueue {
         Task { await runLoop() }
     }
 
+    /// Held back while recording, so a Job never competes with capture for
+    /// memory. Releasing it is `setRecordingActive(false)`, which kicks the
+    /// runner again.
+    public func setRecordingActive(_ active: Bool) {
+        guard recordingActive != active else { return }
+        recordingActive = active
+        if !active { kickRunner() }
+    }
+
+    var localWorkIsHeldBack: Bool {
+        recordingActive && env.provider.isLocal
+    }
+
     func runLoop() async {
         defer { runnerActive = false }
         while let next = jobs.values.first(where: { $0.status == .queued }) {
+            if localWorkIsHeldBack {
+                log.notice("holding local Jobs until the recording stops")
+                return
+            }
             await run(jobID: next.id)
         }
     }
@@ -281,12 +330,6 @@ public actor JobQueue {
         // money, so a cancel landing here must not push on regardless.
         try checkCancelled()
 
-        // Transcode to FLAC for upload (kept beside the CAF originals).
-        let micFLAC = try Transcoder.toFLAC(micCAF)
-        let remoteFLAC = try Transcoder.toFLAC(remoteCAF)
-
-        try checkCancelled()
-
         // R6 (amended): the Mic Track has exactly one speaker, so it goes
         // without diarization and is labelled "Me". The Remote Track is
         // diarized; a speaker count rides along only when the user asserted
@@ -295,12 +338,47 @@ public actor JobQueue {
         // so the names R11 needs as evidence arrive spelled correctly.
         let keyTerms = job.session.mergedKeyTerms(global: env.settings.keyTerms)
 
-        async let micTask = env.provider.transcribe(
-            track: micFLAC, diarize: false, keyTerms: keyTerms, expectedSpeakers: nil)
-        async let remoteTask = env.provider.transcribe(
-            track: remoteFLAC, diarize: true, keyTerms: keyTerms,
-            expectedSpeakers: job.session.expectedSpeakers)
-        let (micUtterances, remoteUtterances) = try await (micTask, remoteTask)
+        /// One Provider's attempt at both Tracks. Whole-Job, never per-Track:
+        /// a Note assembled half locally and half from the cloud would carry a
+        /// provenance its frontmatter could not honestly state.
+        func attempt(_ provider: STTProvider) async throws -> ([Utterance], [Utterance]) {
+            // Local engines read the CAF originals; only an upload needs FLAC.
+            // Transcoding an hour of audio is slow enough to be worth skipping.
+            let micInput = provider.prefersCompressedUpload ? try Transcoder.toFLAC(micCAF) : micCAF
+            let remoteInput = provider.prefersCompressedUpload
+                ? try Transcoder.toFLAC(remoteCAF) : remoteCAF
+            try checkCancelled()
+            async let micTask = provider.transcribe(
+                track: micInput, diarize: false, keyTerms: keyTerms, expectedSpeakers: nil)
+            async let remoteTask = provider.transcribe(
+                track: remoteInput, diarize: true, keyTerms: keyTerms,
+                expectedSpeakers: job.session.expectedSpeakers)
+            return try await (micTask, remoteTask)
+        }
+
+        let primary = env.provider
+        var usedProvider = primary
+        let micUtterances: [Utterance]
+        let remoteUtterances: [Utterance]
+        do {
+            (micUtterances, remoteUtterances) = try await attempt(primary)
+        } catch let error as PipelineError where error.isCancellation {
+            throw error
+        } catch {
+            // Cancellation never falls back; nor does anything when the mode
+            // gave us no second Provider (Cloud and Local modes both do that).
+            try checkCancelled()
+            guard let fallback = env.fallback else { throw error }
+            let reason = (error as? PipelineError)?.description ?? "\(error)"
+            let fromName = primary.name, toName = fallback.name
+            log.warning("""
+                job \(job.id, privacy: .public): \(fromName, privacy: .public) failed, \
+                falling back to \(toName, privacy: .public): \(reason, privacy: .public)
+                """)
+            env.onEvent(.providerFellBack(job, from: fromName, to: toName, reason: reason))
+            (micUtterances, remoteUtterances) = try await attempt(fallback)
+            usedProvider = fallback
+        }
 
         var transcript = mergeTranscripts(
             mic: micUtterances, remote: remoteUtterances,
@@ -342,12 +420,16 @@ public actor JobQueue {
         let summary = try await env.summariser.summarise(
             transcript: transcript, session: job.session, preset: preset)
 
-        // Cost (R10/R14): per submitted Track + Claude tokens.
+        // Cost (R10/R14): per submitted Track + Claude tokens. A local Provider
+        // bills nothing per audio-hour — the electricity is not something this
+        // app is going to pretend to meter — so only the summary counts.
         let trackHours = job.session.recordedDuration / 3600
-        let cost = env.costTable.sttCost(trackHours: trackHours, diarized: false,
-                                         keyterms: !keyTerms.isEmpty)
-            + env.costTable.sttCost(trackHours: trackHours, diarized: true,
+        let sttCost = usedProvider.isLocal ? 0
+            : env.costTable.sttCost(trackHours: trackHours, diarized: false,
                                     keyterms: !keyTerms.isEmpty)
+                + env.costTable.sttCost(trackHours: trackHours, diarized: true,
+                                        keyterms: !keyTerms.isEmpty)
+        let cost = sttCost
             + env.costTable.claudeCost(inputTokens: summary.inputTokens,
                                        outputTokens: summary.outputTokens)
 
@@ -357,7 +439,7 @@ public actor JobQueue {
         do {
             written = try writer.write(session: job.session, noteBody: summary.noteBody,
                                        transcript: transcript,
-                                       provider: env.provider.name, costUSD: cost)
+                                       provider: usedProvider.name, costUSD: cost)
         } catch {
             throw PipelineError.permanent("Vault write: \(error.localizedDescription)")
         }
@@ -387,7 +469,7 @@ public actor JobQueue {
             }
             let noteContents = (try? String(contentsOf: written.noteURL, encoding: .utf8)) ?? ""
             var record = NamingRecord(
-                session: job.session, transcript: transcript, provider: env.provider.name,
+                session: job.session, transcript: transcript, provider: usedProvider.name,
                 costUSD: cost, notePath: written.noteURL.path,
                 transcriptPath: written.transcriptURL.path,
                 noteHash: NamingRecord.hash(noteContents),
