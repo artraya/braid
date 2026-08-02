@@ -93,9 +93,6 @@ public struct Transcript: Sendable, Codable, Equatable {
             }
     }
 
-    /// Applies user-assigned names. Keys are current labels ("Speaker 1"),
-    /// values the names to use. Unmapped and blank entries are left alone, and
-    /// "Me" is never renamed (R11).
     /// Removes Mic-Track echoes of Remote speech (echo cycle, layer 3).
     ///
     /// Speaker playback re-entering the mic puts the far end's words on both
@@ -140,6 +137,9 @@ public struct Transcript: Sendable, Codable, Equatable {
             .filter { !$0.isEmpty })
     }
 
+    /// Applies user-assigned names. Keys are current labels ("Speaker 1"),
+    /// values the names to use. Unmapped and blank entries are left alone, and
+    /// "Me" is never renamed (R11).
     public func renamingSpeakers(_ names: [String: String]) -> Transcript {
         var copy = self
         copy.utterances = utterances.map { u in
@@ -190,15 +190,32 @@ public struct Transcript: Sendable, Codable, Equatable {
     }
 }
 
+/// The merged Transcript, plus how the diarizer's labels map onto it.
+///
+/// Identification works in the diarizer's vocabulary ("S1", or a label
+/// Re-attribution introduced) while everything downstream works in the
+/// Transcript's ("Speaker 1"). The map is how a voice keeps its identity across
+/// that rename — without it, a confident match would have nothing to attach to.
+public struct MergedTranscript: Sendable {
+    public var transcript: Transcript
+    /// Diarizer label → "Speaker N".
+    public var remoteLabels: [String: String]
+
+    public init(transcript: Transcript, remoteLabels: [String: String]) {
+        self.transcript = transcript
+        self.remoteLabels = remoteLabels
+    }
+}
+
 /// SPEC merge rule: both Tracks share the Recording clock; the Transcript is
 /// the utterance lists of both results interleaved by start timestamp.
 /// Remote speakers are renumbered "Speaker 1"… by first appearance; every Mic
-/// utterance is already labelled "Me" by the Adapter.
+/// utterance is already labelled "Me" by the Transcriber.
 public func mergeTranscripts(
     mic: [Utterance],
     remote: [Utterance],
     pauseSpans: [Transcript.PauseMarker]
-) -> Transcript {
+) -> MergedTranscript {
     var renamed: [String: String] = [:]
     var next = 1
     var remoteRelabelled: [Utterance] = []
@@ -217,5 +234,7 @@ public func mergeTranscripts(
     let all = (mic.map { Utterance(speaker: "Me", start: $0.start, end: $0.end, text: $0.text) }
                + remoteRelabelled)
         .sorted { $0.start < $1.start }
-    return Transcript(utterances: all, pauseSpans: pauseSpans)
+    return MergedTranscript(
+        transcript: Transcript(utterances: all, pauseSpans: pauseSpans),
+        remoteLabels: renamed)
 }

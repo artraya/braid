@@ -35,7 +35,7 @@ public struct VaultWriter: Sendable {
     /// Writes Note + Transcript. Collision: lowest free integer suffix (" 2", " 3", …),
     /// applied to the pair so Note and Transcript names always match.
     public func write(session: Session, noteBody: String, transcript: Transcript,
-                      provider: String, costUSD: Double) throws -> Written {
+                      engine: String) throws -> Written {
         let fm = FileManager.default
         let transcriptsDir = vaultURL.appendingPathComponent("transcripts")
         try fm.createDirectory(at: transcriptsDir, withIntermediateDirectories: true)
@@ -55,7 +55,7 @@ public struct VaultWriter: Sendable {
             n += 1
         }
 
-        let front = frontmatter(session: session, provider: provider, costUSD: costUSD,
+        let front = frontmatter(session: session, engine: engine,
                                 transcriptName: "\(candidate) (transcript)")
         try atomicWrite(front + "\n" + noteBody + "\n", to: noteURL(candidate))
         try atomicWrite(transcript.markdown() + "\n", to: transcriptURL(candidate))
@@ -68,16 +68,18 @@ public struct VaultWriter: Sendable {
     /// Vault and break the link the user already has open.
     public func overwrite(noteURL: URL, transcriptURL: URL, session: Session,
                           noteBody: String, transcript: Transcript,
-                          provider: String, costUSD: Double) throws -> Written {
+                          engine: String) throws -> Written {
         let transcriptName = transcriptURL.deletingPathExtension().lastPathComponent
-        let front = frontmatter(session: session, provider: provider, costUSD: costUSD,
+        let front = frontmatter(session: session, engine: engine,
                                 transcriptName: transcriptName)
         try atomicWrite(front + "\n" + noteBody + "\n", to: noteURL)
         try atomicWrite(transcript.markdown() + "\n", to: transcriptURL)
         return Written(noteURL: noteURL, transcriptURL: transcriptURL)
     }
 
-    func frontmatter(session: Session, provider: String, costUSD: Double,
+    /// R10, exactly these keys in this order. Obsidian queries key off the
+    /// names, so they are part of the contract, not a detail.
+    func frontmatter(session: Session, engine: String,
                      transcriptName: String) -> String {
         let day = DateFormatter()
         day.locale = Locale(identifier: "en_AU")
@@ -97,8 +99,7 @@ public struct VaultWriter: Sendable {
         duration: \(Transcript.timestamp(session.recordedDuration))
         preset: \(session.presetName)
         participants: \(participants)
-        provider: \(provider)
-        cost: \(String(format: "%.4f", costUSD))
+        engine: \(engine)
         transcript: "[[\(transcriptName)]]"
         ---
         """

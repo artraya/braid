@@ -10,59 +10,45 @@ public struct SessionRecord: Sendable, Codable, Identifiable, Equatable {
     public var startedAt: Date
     /// Recorded audio only, pauses excluded.
     public var recordedDuration: TimeInterval
-    public var costUSD: Double
     public var notePath: String
 
     public init(id: String, title: String, presetName: String, startedAt: Date,
-                recordedDuration: TimeInterval, costUSD: Double, notePath: String) {
+                recordedDuration: TimeInterval, notePath: String) {
         self.id = id
         self.title = title
         self.presetName = presetName
         self.startedAt = startedAt
         self.recordedDuration = recordedDuration
-        self.costUSD = costUSD
         self.notePath = notePath
     }
 
-    public init(session: Session, costUSD: Double, notePath: String) {
+    public init(session: Session, notePath: String) {
         self.init(id: session.id, title: session.title, presetName: session.presetName,
                   startedAt: session.startedAt, recordedDuration: session.recordedDuration,
-                  costUSD: costUSD, notePath: notePath)
+                  notePath: notePath)
     }
 }
 
-/// This month's recording against the cap the user set.
+/// What this month came to. Minutes only: with the cloud gone nothing the app
+/// does has a price, so there is no spend to track and no cap to enforce
+/// (R14 retired, R18 amended).
 public struct Usage: Sendable, Equatable {
     public let minutesUsed: Double
-    public let minuteCap: Int
-    public let costUSD: Double
-    public let daysLeftInMonth: Int
+    public let sessionCount: Int
 
-    public init(minutesUsed: Double, minuteCap: Int, costUSD: Double, daysLeftInMonth: Int) {
+    public init(minutesUsed: Double, sessionCount: Int) {
         self.minutesUsed = minutesUsed
-        self.minuteCap = minuteCap
-        self.costUSD = costUSD
-        self.daysLeftInMonth = daysLeftInMonth
+        self.sessionCount = sessionCount
     }
 
-    /// Before anything has been recorded or loaded.
-    public static let empty = Usage(minutesUsed: 0, minuteCap: 0, costUSD: 0, daysLeftInMonth: 0)
-
-    /// 0…1, clamped, so the progress bar can be drawn straight from it.
-    public var fraction: Double {
-        guard minuteCap > 0 else { return 0 }
-        return min(1, max(0, minutesUsed / Double(minuteCap)))
-    }
-
-    public var isNearCap: Bool { fraction >= 0.8 }
-    public var isOverCap: Bool { minuteCap > 0 && minutesUsed >= Double(minuteCap) }
+    public static let empty = Usage(minutesUsed: 0, sessionCount: 0)
 }
 
 /// The delivered-Session log, one JSON file, newest first. Both the Job runner
 /// and speaker naming write to it, so access is serialised.
 public final class SessionIndex: @unchecked Sendable {
     /// Far more than a year of real use. Trimming the tail keeps monthly
-    /// figures intact, which is all the usage card reads.
+    /// figures intact, which is all the usage line reads.
     public static let limit = 200
 
     private let url: URL
@@ -89,34 +75,12 @@ public final class SessionIndex: @unchecked Sendable {
         }
     }
 
-    /// Naming a Session's speakers re-runs the Summariser, so its cost grows
-    /// after delivery.
-    public func addCost(_ usd: Double, toSessionID id: String) {
-        lock.withLock {
-            var records = load()
-            guard let index = records.firstIndex(where: { $0.id == id }) else { return }
-            records[index].costUSD += usd
-            save(records)
-        }
-    }
-
-    public func usage(minuteCap: Int, now: Date = Date(),
-                      calendar: Calendar = .current) -> Usage {
+    public func usage(now: Date = Date(), calendar: Calendar = .current) -> Usage {
         let month = all().filter {
             calendar.isDate($0.startedAt, equalTo: now, toGranularity: .month)
         }
-        let minutes = month.reduce(0) { $0 + $1.recordedDuration } / 60
-        let cost = month.reduce(0) { $0 + $1.costUSD }
-        return Usage(minutesUsed: minutes, minuteCap: minuteCap, costUSD: cost,
-                     daysLeftInMonth: Self.daysLeftInMonth(now: now, calendar: calendar))
-    }
-
-    /// Whole days from now to the first of next month, when the cap resets.
-    /// Today counts, so the last day of the month reads "1 day left".
-    public static func daysLeftInMonth(now: Date = Date(), calendar: Calendar = .current) -> Int {
-        guard let range = calendar.range(of: .day, in: .month, for: now) else { return 0 }
-        let today = calendar.component(.day, from: now)
-        return max(0, range.count - today + 1)
+        return Usage(minutesUsed: month.reduce(0) { $0 + $1.recordedDuration } / 60,
+                     sessionCount: month.count)
     }
 
     // MARK: - Storage (callers hold the lock)

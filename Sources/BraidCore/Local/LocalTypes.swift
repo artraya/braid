@@ -3,56 +3,61 @@ import Foundation
 /// Which on-device engine transcribes a Track. Both produce an
 /// `EngineTranscript`; they differ in weight and in what they can be told.
 public enum LocalEngine: String, Sendable, Codable, CaseIterable {
-    /// Parakeet TDT v3 via FluidAudio. Stronger on the disfluent, interrupted
-    /// speech a meeting actually produces, and gives honest token timings.
-    /// Costs a model download.
-    case parakeet
-    /// Apple's SpeechTranscriber. No download at all — the OS owns the assets —
-    /// and Key Terms reach it as contextual strings.
+    /// Apple's SpeechTranscriber. No download at all — the OS owns the assets,
+    /// shared with every other app — and Key Terms reach it as contextual
+    /// strings. Measured 9 points better on turn purity than Parakeet against
+    /// the same diarizer output, which is why it is the default (ADR-0006).
     case apple
+    /// Parakeet TDT via FluidAudio. A slightly lower word error rate on the
+    /// disfluent, interrupted speech a meeting actually produces, at the cost
+    /// of a 443MB model download and no Key Terms support.
+    case parakeet
 
     public var label: String {
         switch self {
-        case .parakeet: "Parakeet"
         case .apple: "Apple Speech"
+        case .parakeet: "Parakeet"
         }
     }
 
-    /// Named in the Note's `provider` frontmatter, so a Note always says what
-    /// produced it (R10 already carries the field).
-    public var providerName: String {
+    /// Named in the Note's `engine` frontmatter, so a Note always says what
+    /// produced it (R10).
+    public var engineName: String {
         switch self {
-        case .parakeet: "local-parakeet"
-        case .apple: "local-apple"
+        case .apple: "apple-speech"
+        case .parakeet: "parakeet"
         }
     }
+
+    /// Whether choosing this engine means waiting for a download.
+    public var needsDownload: Bool { self == .parakeet }
 }
 
-/// Where transcription happens.
+/// When a Session's Note is written (CONTEXT.md: Delivery).
 ///
-/// `auto` prefers local and falls back to the cloud, always disclosing it.
-/// `local` never reaches the network under any failure — a Job parks as
-/// `.failed` instead, because silently uploading audio the user asked to keep
-/// on the machine would be the worst bug this app could have.
-public enum ProviderMode: String, Sendable, Codable, CaseIterable {
-    case cloud, local, auto
+/// One setting, not a mode: the only question is whether a Note may be written
+/// while some voices are still unidentified. `held` is the answer for people
+/// who would rather wait than fix a filed Note afterwards, and it never waits
+/// when there is nothing to ask (R26).
+public enum Delivery: String, Sendable, Codable, CaseIterable {
+    case immediate
+    case held
 
     public var label: String {
         switch self {
-        case .cloud: "Cloud"
-        case .local: "On this Mac"
-        case .auto: "Automatic"
+        case .immediate: "As soon as it's ready"
+        case .held: "After I've named the speakers"
         }
     }
 }
 
 /// One speaker's turn, as the diarizer heard it.
 ///
-/// Deliberately carries no embedding. FluidAudio's `TimedSpeakerSegment`
-/// exposes the raw voice vector it clustered on; mapping into this type at the
-/// boundary is where ADR-0003 is enforced, so nothing downstream can persist a
-/// voiceprint even by accident. Speaker identity is an opaque within-Session
-/// label and nothing more.
+/// Carries a label and two timestamps and nothing else. The voice data the
+/// diarizer also produces travels separately, as `SpeakerVoice` and
+/// `VoiceChunk`, so the aligner — the part that decides who said what — cannot
+/// see it and no accidental path exists from a turn to a stored voiceprint
+/// (R21, ADR-0007).
 public struct SpeakerSpan: Sendable, Equatable {
     public var speakerId: String
     public var start: TimeInterval

@@ -1,0 +1,16 @@
+# The Voice Database: local voiceprints, deliberately
+
+status: supersedes [ADR-0003](0003-no-voiceprints-ever.md)
+
+ADR-0003 banned voiceprints "ever" while Braid was headed for public distribution, on the reasoning that cross-meeting voice memory is exactly the litigated behaviour of the cloud notetakers. The premise changed: Braid is a private, single-owner, zero-cloud app ([ADR-0006](0006-zero-cloud.md)). No enrollment service is called, no voice data is shared, transmitted, or monetised; what remains is the owner's own machine remembering voices the owner has personally named, the digitised equivalent of recognising a colleague by ear. On that footing the Voice Database is built: an encrypted local store of Persons, each holding a small capped set of Voiceprints, fed only by the owner's confirmed Identifications, and used to auto-name returning Speakers, suggest names for plausible ones, and correct diarization through Re-attribution.
+
+The design keeps three disciplines that made ADR-0003 safe, rather than discarding them with its conclusion. First, the raw-data boundary survives: per-turn and per-chunk embeddings still die with the Job that produced them; the only thing that persists is one vetted representative of a Speaker the owner explicitly named. Second, precision over recall: a wrong auto-name is a defect, not a tuning matter; below the auto bar the app suggests and asks, it never asserts. Third, the user's deletion rights are first-class: forget a Person, delete the database, and both are ordinary Settings actions that never touch existing Notes.
+
+## Consequences
+
+- **At rest**: one encrypted file under Application Support (CryptoKit), its key in the macOS Keychain marked this-device-only. A copied database file, on a backup drive or anywhere else, is unreadable. Export is the only readable egress and is an explicit user action; import restores an export. Restoring a Time Machine backup to a different Mac cannot recover the database, by design; export is the cross-machine path.
+- **Enrollment only through Identification**: there is no training ceremony and no bulk import of voices. Naming a Speaker enrolls its representative; correcting a wrong suggestion removes the Voiceprint that caused it. The capped exemplar set (oldest evicted) keeps every Person's footprint bounded and current.
+- **Me is a special case**: the owner's own Voiceprint is stored solely to recognise echo bleeding into the Remote Track, and is never used to identify anyone else.
+- **Voice Clips are transient**: extracted before the Recording is deleted, kept only until the Session's Identification resolves, then deleted. No other audio-derived artifact survives outside the Vault.
+- **Voiceprints are model-bound**: the database is stamped with the embedding model version. If the model changes, existing Voiceprints go stale and matching is disabled until people are re-enrolled through ordinary naming; silently matching across model versions risks exactly the wrong-name failure the precision rule forbids.
+- **The no-calendar rule is untouched**: identification comes from voices and the owner's own naming, never from calendars, contact lists, or any external source of identity.

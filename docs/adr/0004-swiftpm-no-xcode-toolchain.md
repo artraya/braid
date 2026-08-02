@@ -1,5 +1,7 @@
 # SwiftPM + Command Line Tools, no Xcode, self-signed identity, zero dependencies
 
+status: amended 2026-08-02 — the Anthropic `URLSession` call and the FLAC transcode below no longer exist ([ADR-0006](0006-zero-cloud.md), zero-cloud); the zero-dependency policy has exactly one deliberate exception, FluidAudio, pinned exactly ([ADR-0005](0005-local-transcription-as-a-provider.md)); the no-distribution reference below is SPEC non-goal 7 in the current numbering. The toolchain, signing identity, and everything else stand.
+
 The build machine (macOS 27.0, Swift 6.4 CLT) has no Xcode, and installing it (12+ GB, App Store interaction) buys nothing the project needs. We build with Swift Package Manager: `swift build` produces the executable and a repo script assembles and signs the `.app` bundle (Info.plist, `LSUIElement`, resources). Signing uses a local self-signed identity, "ms-notes Development" (created 2026-07-31, trusted for code signing in the login keychain), which gives the stable code identity macOS's privacy system (TCC) needs to remember audio permissions across rebuilds — no Apple Developer account involved. Third-party dependencies are zero by policy: capture, CAF/FLAC audio, HTTP, Keychain, logging, and UI all come from OS frameworks, and the Anthropic call is plain `URLSession` HTTP.
 
 ## Consequences

@@ -1,12 +1,13 @@
 import Foundation
 
-/// App settings. Non-secret values in UserDefaults; API keys in the Keychain
-/// only (SPEC R13). Presets are seeded from repo defaults at first access
-/// (R12) and user-editable afterwards.
+/// App settings, all non-secret, all in UserDefaults.
+///
+/// There are no API keys any more: Braid holds no accounts and calls no
+/// services (R13, ADR-0006). The one secret it does keep, the Voice Database
+/// key, lives in the Keychain under `SecretBox` and never passes through here.
 public struct SettingsStore: Sendable {
     // UserDefaults is documented thread-safe; Foundation just hasn't marked it Sendable.
     nonisolated(unsafe) let defaults: UserDefaults
-    public let keychain = KeychainStore()
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -34,25 +35,14 @@ public struct SettingsStore: Sendable {
         }
     }
 
-    /// Minutes of recording the user allows themselves per calendar month. The
-    /// usage card warns as this approaches, but recording is never blocked:
-    /// losing a meeting is worse than overshooting a self-imposed budget.
-    public var monthlyMinuteCap: Int {
-        get {
-            let stored = defaults.integer(forKey: "monthlyMinuteCap")
-            return stored > 0 ? stored : 600
-        }
-        nonmutating set { defaults.set(max(0, newValue), forKey: "monthlyMinuteCap") }
-    }
-
     /// Stop recording by itself when the call app lets go of the microphone.
-    /// Starting is always deliberate; only stopping is automated.
+    /// Starting is always deliberate; only stopping is automated (R17).
     public var autoEndEnabled: Bool {
         get { defaults.object(forKey: "autoEndEnabled") as? Bool ?? true }
         nonmutating set { defaults.set(newValue, forKey: "autoEndEnabled") }
     }
 
-    /// Bundle IDs treated as call apps, matched as prefixes.
+    /// Bundle IDs treated as call apps, matched as prefixes (R17).
     public var callAppBundleIDs: [String] {
         get {
             let stored = defaults.stringArray(forKey: "callAppBundleIDs") ?? []
@@ -61,42 +51,34 @@ public struct SettingsStore: Sendable {
         nonmutating set { defaults.set(newValue, forKey: "callAppBundleIDs") }
     }
 
-    /// Where transcription happens. Auto once local is installed: it costs
-    /// nothing, keeps the audio here, and needs no decision from the user —
-    /// which is the whole point of the app.
-    public var providerMode: ProviderMode {
-        get {
-            guard let raw = defaults.string(forKey: "providerMode"),
-                  let mode = ProviderMode(rawValue: raw) else { return .cloud }
-            return mode
-        }
-        nonmutating set { defaults.set(newValue.rawValue, forKey: "providerMode") }
-    }
-
-    /// Which on-device engine runs in Local and Auto modes.
+    /// Which on-device engine transcribes. Apple by default: it measured better
+    /// on speaker attribution, takes Key Terms, and downloads nothing
+    /// (ADR-0006).
     public var localEngine: LocalEngine {
         get {
             guard let raw = defaults.string(forKey: "localEngine"),
-                  let engine = LocalEngine(rawValue: raw) else { return .parakeet }
+                  let engine = LocalEngine(rawValue: raw) else { return .apple }
             return engine
         }
         nonmutating set { defaults.set(newValue.rawValue, forKey: "localEngine") }
     }
 
-    /// Set once the local models are downloaded and loaded at least once, so
-    /// the app knows whether choosing Local means a wait.
+    /// When a Session's Note is written (R26). Immediate by default: waiting is
+    /// the exception, chosen by people who would rather name speakers up front
+    /// than correct a Note that is already filed.
+    public var delivery: Delivery {
+        get {
+            guard let raw = defaults.string(forKey: "delivery"),
+                  let mode = Delivery(rawValue: raw) else { return .immediate }
+            return mode
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: "delivery") }
+    }
+
+    /// Set once the chosen engine's models are loaded at least once, so the app
+    /// knows whether the next Session means a wait.
     public var localModelsInstalled: Bool {
         get { defaults.bool(forKey: "localModelsInstalled") }
         nonmutating set { defaults.set(newValue, forKey: "localModelsInstalled") }
-    }
-
-    /// Running cost total in USD (SPEC R14).
-    public var costTotalUSD: Double {
-        get { defaults.double(forKey: "costTotalUSD") }
-        nonmutating set { defaults.set(newValue, forKey: "costTotalUSD") }
-    }
-
-    public func addCost(_ usd: Double) {
-        costTotalUSD += usd
     }
 }
