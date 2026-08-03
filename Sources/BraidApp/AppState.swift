@@ -3,6 +3,7 @@ import AppKit
 import Observation
 import ServiceManagement
 import BraidCore
+import BraidMLX
 
 /// Bridges the CaptureEngine and JobQueue into UI state. `onChange` fires on
 /// every state mutation so the status item can refresh; SwiftUI observes the
@@ -31,17 +32,30 @@ final class AppState {
     let settings: SettingsStore
     let transcripts: TranscriptStore
     let sessions: SessionIndex
+    let voices: VoiceStore
+    let clips: VoiceClipStore
     var onChange: (() -> Void)?
 
     /// Injectable so `--ui-preview` can run against a scratch defaults suite
     /// rather than reading, or writing, the real settings.
     init(settings: SettingsStore = SettingsStore(),
          transcripts: TranscriptStore = TranscriptStore(),
-         sessions: SessionIndex = SessionIndex()) {
+         sessions: SessionIndex = SessionIndex(),
+         voices: VoiceStore = VoiceStore(),
+         clips: VoiceClipStore = VoiceClipStore()) {
         self.settings = settings
         self.transcripts = transcripts
         self.sessions = sessions
+        self.voices = voices
+        self.clips = clips
     }
+
+    /// The people Braid can recognise, for the Settings list (R29).
+    var knownPeople: [Person] = []
+    /// Set when the on-device model cannot write Notes right now.
+    var summariserProblem: String?
+    /// Progress while the open-weights model downloads, nil when idle.
+    var modelDownload: String? { didSet { onChange?() } }
 
     /// Finished Sessions whose Remote speakers are still "Speaker 1", "Speaker 2".
     var awaitingNames: [NamingRecord] = [] { didSet { onChange?() } }
@@ -56,7 +70,6 @@ final class AppState {
     let engine = CaptureEngine()
     private var queue: JobQueue?
     private var currentSession: Session?
-    private var namer: SpeakerNamer?
     private var callWatcher: CallWatcher?
     private var autoEndTimer: Timer?
 
@@ -72,62 +85,126 @@ final class AppState {
         return "waveform.circle"
     }
 
-    /// Cached, not queried on demand: SwiftUI reads `setupComplete` on every
-    /// redraw, and a Keychain lookup per frame is both slow and a good way to
-    /// provoke consent prompts.
-    var keysConfigured = false
+    /// Setup is one decision now: where the Vault is. No accounts, no keys
+    /// (R13, ADR-0006).
+    var setupComplete: Bool { settings.vaultPath != nil }
 
-    var setupComplete: Bool { keysConfigured && settings.vaultPath != nil }
-
-    /// The Anthropic key is always needed — the Summariser writes the Note and
-    /// stays in the cloud. The AssemblyAI key is only needed when transcription
-    /// actually goes there: on this Mac, setup is one key, not two.
-    func refreshKeyState() {
-        let anthropic = settings.keychain.get(.anthropic) != nil
-        let assemblyAI = settings.keychain.get(.assemblyAI) != nil
-        keysConfigured = anthropic && (settings.providerMode == .cloud ? assemblyAI : true)
-    }
-
-    /// Primary and fallback for the current mode.
-    ///
-    /// Local mode returns no fallback at all, which is what makes its promise
-    /// structural rather than a policy someone could later forget: with no
-    /// cloud Provider in the Environment there is nothing for a failure to
-    /// reach. Auto without an AssemblyAI key is simply local.
-    private func providers() -> (primary: STTProvider, fallback: STTProvider?)? {
-        let cloud = settings.keychain.get(.assemblyAI).map { AssemblyAIAdapter(apiKey: $0) }
-        switch settings.providerMode {
-        case .cloud:
-            guard let cloud else { return nil }
-            return (cloud, nil)
-        case .local:
-            return (LocalAdapter.make(engine: settings.localEngine), nil)
-        case .auto:
-            return (LocalAdapter.make(engine: settings.localEngine), cloud)
+    /// Applies an Engine change to the running queue.
+    func applyEngineSettings() {
+        guard let queue else { return }
+        let transcriber = Transcriber.make(engine: settings.localEngine)
+        let summariser = makeSummariser()
+        Task {
+            await queue.updateTranscriber(transcriber)
+            await queue.updateSummariser(summariser)
         }
     }
 
-    /// Applies a Provider-mode or engine change to the running queue.
-    func applyProviderSettings() {
-        refreshKeyState()
-        guard let queue, let picked = providers() else { return }
-        Task { await queue.updateProviders(primary: picked.primary, fallback: picked.fallback) }
+    /// The chosen Note writer. The MLX model is only constructed when it is
+    /// actually selected, so choosing Apple's never touches the open-weights
+    /// path at all.
+    func makeSummariser() -> any NoteSummarising {
+        switch settings.summaryEngine {
+        case .appleBuiltIn:
+            return AppleSummariser()
+        case .openWeights:
+            let model = MLXSummariser.Model(rawValue: settings.openWeightsModel) ?? .qwen3_4b
+            return MLXSummariser(model: model)
+        }
     }
 
-    /// Downloads and loads the local models so the first Session after
-    /// switching does not stall. Safe to call repeatedly.
+    /// Loads the on-device models so the first Session after switching does not
+    /// stall, and checks that the Summariser can actually run. Safe to call
+    /// repeatedly.
     func prepareLocalModels() {
         let engine = settings.localEngine
         let settings = self.settings
+        // Only Apple's engine has an availability answer; the open-weights one
+        // either downloads or reports why it could not.
+        summariserProblem = settings.summaryEngine == .appleBuiltIn
+            ? AppleSummariser.availability : nil
+        let openWeights: MLXSummariser? = settings.summaryEngine == .openWeights
+            ? MLXSummariser(model: MLXSummariser.Model(rawValue: settings.openWeightsModel) ?? .qwen3_4b)
+            : nil
         Task {
             do {
-                try await LocalAdapter.make(engine: engine).prepare()
+                try await Transcriber.make(engine: engine).prepare()
+                if let openWeights {
+                    await MainActor.run { self.modelDownload = "Fetching the summary model…" }
+                    try await openWeights.prepare { fraction in
+                        Task { @MainActor in
+                            self.modelDownload = fraction < 1
+                                ? "Fetching the summary model… \(Int(fraction * 100))%"
+                                : nil
+                        }
+                    }
+                }
                 await MainActor.run {
                     settings.localModelsInstalled = true
                     self.localModelError = nil
+                    self.modelDownload = nil
                 }
             } catch {
-                await MainActor.run { self.localModelError = "\(error)" }
+                await MainActor.run {
+                    self.localModelError = "\(error)"
+                    self.modelDownload = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - The Voice Database (R29)
+
+    func refreshPeople() {
+        let voices = self.voices
+        Task {
+            let people = await voices.persons()
+            await MainActor.run { self.knownPeople = people }
+        }
+    }
+
+    func renamePerson(id: String, to name: String) {
+        let voices = self.voices
+        Task {
+            await voices.rename(personID: id, to: name)
+            await MainActor.run { self.refreshPeople() }
+        }
+    }
+
+    func forgetPerson(id: String) {
+        let voices = self.voices
+        Task {
+            await voices.forget(personID: id)
+            await MainActor.run { self.refreshPeople() }
+        }
+    }
+
+    func forgetEveryone() {
+        let voices = self.voices
+        Task {
+            await voices.deleteEverything()
+            await MainActor.run { self.refreshPeople() }
+        }
+    }
+
+    func exportVoices(to url: URL) {
+        let voices = self.voices
+        Task {
+            do { try await voices.export(to: url) }
+            catch { await MainActor.run { self.lastError = "Could not export: \(error)" } }
+        }
+    }
+
+    func importVoices(from url: URL) {
+        let voices = self.voices
+        Task {
+            do {
+                try await voices.importDatabase(from: url)
+                await MainActor.run { self.refreshPeople() }
+            } catch {
+                await MainActor.run {
+                    self.lastError = "Could not import: the file is not a voice database from this app's model version."
+                }
             }
         }
     }
@@ -135,16 +212,13 @@ final class AppState {
     // MARK: - Lifecycle
 
     func bootstrap() {
-        refreshKeyState()
         guard queue == nil else { return }
-        guard let claudeKey = settings.keychain.get(.anthropic),
-              let picked = providers() else { return }
-        let summariser = Summariser(apiKey: claudeKey)
         let env = JobQueue.Environment(
-            provider: picked.primary,
-            fallback: picked.fallback,
-            summariser: summariser,
+            transcriber: Transcriber.make(engine: settings.localEngine),
+            summariser: makeSummariser(),
             settings: settings,
+            voices: voices,
+            clips: clips,
             transcripts: transcripts,
             sessions: sessions,
             onEvent: { [weak self] event in
@@ -152,11 +226,14 @@ final class AppState {
             })
         let queue = JobQueue(env: env)
         self.queue = queue
-        self.namer = SpeakerNamer(summariser: summariser, settings: settings,
-                                  store: transcripts, sessions: sessions)
         transcripts.purgeExpired()
+        summariserProblem = AppleSummariser.availability
         refreshNamingState()
         refreshSessions()
+        refreshPeople()
+        // Clips belong to a Session still expecting names; anything else is
+        // audio with no reason to exist (R25).
+        clips.purgeOrphans(keeping: Set(transcripts.all().map(\.id)))
         Task {
             await queue.loadPersisted()
             await self.refreshJobState()
@@ -190,20 +267,25 @@ final class AppState {
             Notifier.notify(
                 title: "Recorded on speakers",
                 body: "The far end leaked into your mic. Duplicated lines will be removed — headphones avoid this next time.")
-        case .providerFellBack(_, from: _, to: let to, reason: _):
-            // Audio going somewhere the user did not expect is never a silent
-            // event, even though the Note still arrives.
-            Notifier.notify(
-                title: "Transcribed in the cloud instead",
-                body: "On-device transcription failed, so this recording went to \(to). The note says so too.")
         case .speakersDetected(let job, let stats, let mismatch):
             refreshNamingState()
             let count = stats.count
             let body = job.session.title + (mismatch.map { " — \($0.message)" }
-                ?? " — name them from the menu to rewrite the note.")
+                ?? " — name them to rewrite the note.")
             Notifier.notifySpeakers(
                 sessionID: job.id,
-                title: "\(count) speaker\(count == 1 ? "" : "s") to name",
+                title: "\(count) voice\(count == 1 ? "" : "s") to name",
+                body: body)
+        case .heldForNames(let job, let stats, let mismatch):
+            // R26: nothing is written yet, so the notification has to say that
+            // plainly — otherwise a Note that never arrives reads as a failure.
+            refreshNamingState()
+            let count = stats.count
+            let body = job.session.title + " — the note is waiting on these names."
+                + (mismatch.map { " \($0.message)" } ?? "")
+            Notifier.notifySpeakers(
+                sessionID: job.id,
+                title: "\(count) voice\(count == 1 ? "" : "s") to name",
                 body: body)
         }
         Task { await refreshJobState() }
@@ -242,21 +324,7 @@ final class AppState {
 
     func refreshSessions() {
         recentSessions = sessions.recent(20)
-        usage = sessions.usage(minuteCap: settings.monthlyMinuteCap)
-    }
-
-    /// What the Session running right now has cost so far: both Tracks at the
-    /// elapsed recorded duration, plus a flat estimate for the summary. Shown
-    /// live in the HUD, so it is deliberately an estimate and rounds up rather
-    /// than surprising you at the end.
-    var liveCostEstimate: Double {
-        guard let startedAt = recordingStartedAt else { return 0 }
-        let hours = Date().timeIntervalSince(startedAt) / 3600
-        let table = CostTable.current
-        let keyterms = !settings.keyTerms.isEmpty
-        return table.sttCost(trackHours: hours, diarized: false, keyterms: keyterms)
-            + table.sttCost(trackHours: hours, diarized: true, keyterms: keyterms)
-            + table.claudeCost(inputTokens: Int(hours * 9_000), outputTokens: 1_200)
+        usage = sessions.usage()
     }
 
     /// Opens a Note in Obsidian, falling back to whatever handles markdown.
@@ -272,25 +340,26 @@ final class AppState {
 
     // MARK: - Speaker naming
 
-    /// Relabels a delivered Session and re-runs the Summariser. Costs one
-    /// Claude call; the Recording is long gone, so nothing is re-transcribed.
+    /// Puts names to a Session's voices and teaches the Voice Database what it
+    /// just learned (R24). A delivered Session is re-summarised and rewritten;
+    /// a Held one is summarised and written for the first time (R26).
     func applyNames(_ names: [String: String], toSessionID id: String,
-                    completion: @escaping (Result<SpeakerNamer.Result, Error>) -> Void) {
-        guard let namer else {
-            completion(.failure(PipelineError.permanent("API keys not configured")))
+                    completion: @escaping (Result<URL, Error>) -> Void) {
+        bootstrap()
+        guard let queue else {
+            completion(.failure(PipelineError.permanent("the pipeline is not running")))
             return
         }
         Task {
             do {
-                let result = try await namer.apply(names: names, toSessionID: id)
+                let noteURL = try await queue.applyNames(sessionID: id, names: names)
                 self.refreshNamingState()
                 self.refreshSessions()
-                Notifier.notify(
-                    title: "Note updated",
-                    body: result.wroteNewPair
-                        ? "The original had been edited, so a new note was written."
-                        : result.noteURL.deletingPathExtension().lastPathComponent)
-                completion(.success(result))
+                self.refreshPeople()
+                await self.refreshJobState()
+                Notifier.notify(title: "Note updated",
+                                body: noteURL.deletingPathExtension().lastPathComponent)
+                completion(.success(noteURL))
             } catch {
                 self.lastError = "Could not apply names: \(error)"
                 completion(.failure(error))
@@ -298,31 +367,51 @@ final class AppState {
         }
     }
 
+    /// R25: the user would rather not name these. That resolves the Session —
+    /// the clips go, and a Held Session delivers with generic labels.
+    func skipNaming(sessionID: String) {
+        bootstrap()
+        let queue = self.queue
+        Task {
+            do {
+                _ = try await queue?.skipNaming(sessionID: sessionID)
+                self.refreshNamingState()
+                self.refreshSessions()
+                await self.refreshJobState()
+            } catch {
+                self.lastError = "Could not skip naming: \(error)"
+            }
+        }
+    }
+
     // MARK: - Session control
 
-    func start(title: String, presetName: String, participants: String,
-               speakerCount: Int? = nil, speakersStrict: Bool = false) {
+    /// Starts a Session. Nothing is asked for that Braid can work out itself:
+    /// the Preset comes from Settings and the title comes from the summary
+    /// afterwards (R9a), so the only thing the panel passes in is who is on the
+    /// call and how many voices to expect.
+    func start(participants: [String], speakerCount: Int? = nil,
+               speakersStrict: Bool = false) {
         guard phase == .idle else { return }
         bootstrap()
         let names = participants
-            .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        let resolvedTitle = title.trimmingCharacters(in: .whitespaces).isEmpty
-            ? presetName
-            : title.trimmingCharacters(in: .whitespaces)
+        let startedAt = Date()
+        let placeholder = Session.placeholderTitle(at: startedAt)
         let expectation = speakerCount.map {
             Session.SpeakerExpectation(count: $0, strict: speakersStrict)
         }
-        let session = Session(title: resolvedTitle, presetName: presetName,
+        let session = Session(title: placeholder,
+                              presetName: settings.defaultPresetName,
                               participants: names, expectedSpeakers: expectation,
-                              startedAt: Date())
+                              startedAt: startedAt, autoTitled: true)
         let dir = JobQueue.appSupportURL.appendingPathComponent("jobs")
             .appendingPathComponent(session.id)
         do {
             try engine.start(into: dir)
             currentSession = session
-            currentTitle = resolvedTitle
+            currentTitle = placeholder
             recordingStartedAt = session.startedAt
             lastError = nil
             phase = .recording

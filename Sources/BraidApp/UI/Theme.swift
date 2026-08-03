@@ -19,7 +19,12 @@ enum Theme {
     static let dim = Color(white: 0.63)
     static let faint = Color(white: 0.42)
 
-    static let panelWidth: CGFloat = 380
+    /// Narrow on purpose (owner decision 2026-08-03): the panel drops out of
+    /// the menu bar over whatever you are doing, and at 380 it covered a good
+    /// deal of it. Everything in it is a short line or a chip, so the width was
+    /// mostly padding. Layouts here have to survive it — nothing may assume two
+    /// controls fit side by side.
+    static let panelWidth: CGFloat = 228
     static let corner: CGFloat = 16
     static let cardCorner: CGFloat = 12
     static let padding: CGFloat = 16

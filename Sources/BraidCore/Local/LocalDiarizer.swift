@@ -71,20 +71,35 @@ public struct LocalDiarizer: SpeakerDiarizing {
     /// whether it helps rather than the question being settled by assumption.
     let zeroVoteReembed: Bool
 
-    /// Defaults left where they were measured.
+    /// Measured defaults, and the measurement was worth redoing.
     ///
-    /// The obvious suspicion on real call audio was that short backchannels
-    /// ("yeah", "sure") fall under the 1.0s floor, get no embedding, and are
-    /// absorbed into whoever was talking around them — which in a meeting
-    /// means an agreement attributed to the wrong person. Dropping the floor
-    /// to 0.4s and halving the step on `fixture-remote.flac` produced 62
-    /// diarizer turns instead of 48 but only 18 speaker changes instead of 17,
-    /// left turn purity identical at 61.4%, and cost 20% more time. The extra
-    /// turns were the same speaker split finer, not the missing alternations.
-    /// The coarse turn resolution is the model's, not this configuration's, so
-    /// paying for the finer settings buys nothing. Exposed as parameters so
-    /// the next fixture can re-test the question cheaply.
-    public init(minTurnSeconds: Double = 1.0, stepRatio: Double = 0.2,
+    /// The suspicion on real call audio was that short backchannels ("yeah",
+    /// "sure") fall under FluidAudio's 1.0s floor, get no embedding, and are
+    /// absorbed into whoever was talking around them — in a meeting, an
+    /// agreement attributed to the wrong person. Tested once under Parakeet, it
+    /// changed nothing and was rejected. Retested under Apple SpeechTranscriber
+    /// after it became the default engine, it is worth a lot, because the gain
+    /// depends on word timings precise enough to place words in the extra turns:
+    ///
+    /// | minTurn | step | turns | purity | speed |
+    /// |---|---|---|---|---|---|
+    /// | 1.0 | 0.2 | 48 | 70.5% | 18x |
+    /// | 0.5 | 0.1 | 59 | 75.0% | 17x |
+    /// | **0.4** | **0.1** | **62** | **77.3%** | **17x** |
+    /// | 0.5 | 0.05 | 58 | 75.0% | 12x |
+    /// | 0.3 | 0.05 | 67 | 75.0% | 12x |
+    ///
+    /// So 0.4/0.1: +6.8 points of turn purity for no measurable time. Finer than
+    /// that splits real turns without finding new speaker changes and costs a
+    /// third of the throughput. The lesson worth keeping is that a tuning
+    /// result belongs to the engine it was measured under — this one was stale
+    /// the moment the default engine changed.
+    ///
+    /// `zeroVoteReembed` was measured at the same time and rejected: FluidAudio
+    /// documents it as recovering turns absorbed into a neighbour, which is
+    /// exactly this failure, but on this fixture it dropped purity to 68.2% and
+    /// invented a third voice where the reference has two.
+    public init(minTurnSeconds: Double = 0.4, stepRatio: Double = 0.1,
                 zeroVoteReembed: Bool = false) {
         self.minTurnSeconds = minTurnSeconds
         self.stepRatio = stepRatio
@@ -125,6 +140,12 @@ public struct LocalDiarizer: SpeakerDiarizing {
         let result: DiarizationResult
         do {
             result = try await manager.process(file)
+        } catch OfflineDiarizationError.noSpeechDetected {
+            // Nobody spoke on this Track. That is a fact about the recording,
+            // not a failure of the pipeline: R16's territory, where the Session
+            // still delivers a Note from whatever *was* captured. Failing here
+            // would park the Job and lose the user's own side of the call too.
+            return DiarizationOutput(spans: [])
         } catch {
             throw LocalEngineError.diarizationFailed("\(error)")
         }
@@ -166,10 +187,10 @@ public struct LocalDiarizer: SpeakerDiarizing {
         }
 
         let ids = Set(seconds.keys).union(grouped.keys)
-        return ids.compactMap { id in
+        return ids.compactMap { id -> SpeakerVoice? in
             let centroid = database?[id].map(Vector.normalised)
                 ?? Vector.centroid(grouped[id] ?? [])
-            guard let centroid, !centroid.isEmpty else { return nil }
+            guard !centroid.isEmpty else { return nil }
             return SpeakerVoice(speakerId: id, centroid: centroid,
                                 seconds: seconds[id] ?? 0)
         }

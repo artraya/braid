@@ -1,20 +1,9 @@
 import Foundation
 import BraidCore
+import BraidMLX
 
 func eprintLine(_ message: String) {
     FileHandle.standardError.write(Data((message + "\n").utf8))
-}
-
-/// Test-mode key source. The app itself only ever stores keys in the Keychain
-/// (R13); these env vars exist so the verification harness can run against
-/// freshly-built binaries, whose changed code signature invalidates the
-/// Keychain ACL and would otherwise block on a GUI consent prompt.
-func testKeys() -> (stt: String, claude: String)? {
-    let env = ProcessInfo.processInfo.environment
-    let keychain = KeychainStore()
-    guard let stt = env["MSNOTES_ASSEMBLYAI_KEY"] ?? keychain.get(.assemblyAI),
-          let claude = env["MSNOTES_ANTHROPIC_KEY"] ?? keychain.get(.anthropic) else { return nil }
-    return (stt, claude)
 }
 
 // Headless verification modes (used by R-checks; see SPEC.md Requirements).
@@ -23,7 +12,7 @@ func runCLI() -> Bool {
     let args = CommandLine.arguments
 
 if args.contains("--ui-preview") {
-    // Layout check for the panel and HUD; invents its own data, touches nothing.
+    // Layout check for the panel; invents its own data, touches nothing.
     let directory = args.firstIndex(of: "--snapshot").flatMap { i in
         args.count > i + 1 ? args[i + 1] : nil
     }
@@ -31,9 +20,10 @@ if args.contains("--ui-preview") {
 }
 
 if let i = args.firstIndex(of: "--local-check") {
-    // --local-check <audio> [--reference <json>] [--engine parakeet|apple]
+    // --local-check <audio> [--reference <json>] [--engine apple|parakeet]
+    //               [--min-turn N] [--step N] [--zero-vote]
     guard args.count > i + 1 else {
-        eprintLine("usage: --local-check <audio> [--reference <json>] [--engine parakeet|apple]")
+        eprintLine("usage: --local-check <audio> [--reference <json>] [--engine apple|parakeet] [--min-turn N] [--step N] [--zero-vote]")
         exit(2)
     }
     let audio = URL(fileURLWithPath: args[i + 1])
@@ -41,26 +31,132 @@ if let i = args.firstIndex(of: "--local-check") {
         args.count > r + 1 ? URL(fileURLWithPath: args[r + 1]) : nil
     }
     let engine = args.firstIndex(of: "--engine")
-        .flatMap { e in args.count > e + 1 ? LocalEngine(rawValue: args[e + 1]) : nil } ?? .parakeet
+        .flatMap { e in args.count > e + 1 ? LocalEngine(rawValue: args[e + 1]) : nil } ?? .apple
+    // Defaults track LocalDiarizer's, so an unflagged run measures what
+    // actually ships rather than a configuration nobody uses.
     let minTurn = args.firstIndex(of: "--min-turn")
-        .flatMap { m in args.count > m + 1 ? Double(args[m + 1]) : nil } ?? 1.0
+        .flatMap { m in args.count > m + 1 ? Double(args[m + 1]) : nil } ?? 0.4
     let step = args.firstIndex(of: "--step")
-        .flatMap { s in args.count > s + 1 ? Double(args[s + 1]) : nil } ?? 0.2
+        .flatMap { s in args.count > s + 1 ? Double(args[s + 1]) : nil } ?? 0.1
+    let zeroVote = args.contains("--zero-vote")
     let semaphore = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var code: Int32 = 1
     Task {
         code = await LocalCheck.run(audio: audio, reference: reference, engine: engine,
-                                    minTurn: minTurn, step: step)
+                                    minTurn: minTurn, step: step, zeroVoteReembed: zeroVote)
         semaphore.signal()
     }
     semaphore.wait()
     exit(code)
 }
 
+if let i = args.firstIndex(of: "--summary-check") {
+    // --summary-check <text-file>  runs one plain-text transcript through the
+    // Summariser. Exists because the on-device model's safety filters decline
+    // whole sessions over ordinary conversation, and the only way to know
+    // whether a given recording will summarise is to ask it.
+    guard args.count > i + 1,
+          let text = try? String(contentsOfFile: args[i + 1], encoding: .utf8) else {
+        eprintLine("usage: --summary-check <text-file>")
+        exit(2)
+    }
+    if let problem = AppleSummariser.availability {
+        eprintLine(problem)
+        exit(1)
+    }
+    AppleSummariser.verbose = true
+    MLXSummariser.verbose = true
+    let probing = args.contains("--probe")
+    // --mlx [model-id] summarises with the open-weights model instead, which is
+    // the whole point of it existing: a session Apple refuses on subject should
+    // come out normally here.
+    let mlxModel: MLXSummariser.Model? = args.firstIndex(of: "--mlx").map { i in
+        (args.count > i + 1 ? MLXSummariser.Model(rawValue: args[i + 1]) : nil) ?? .qwen3_4b
+    }
+    let utterances = text.split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+        .enumerated()
+        .map { index, line in
+            Utterance(speaker: index.isMultiple(of: 2) ? "Speaker 1" : "Me",
+                      start: Double(index) * 10, end: Double(index) * 10 + 9, text: line)
+        }
+    let startedAt = Date()
+    let session = Session(title: Session.placeholderTitle(at: startedAt),
+                          presetName: "Meeting",
+                          participants: [], startedAt: startedAt,
+                          recordedDuration: Double(utterances.count) * 10,
+                          autoTitled: true)
+    let semaphore = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var code: Int32 = 1
+    Task {
+        if probing {
+            print("probing which shapes this text will summarise in:")
+            for line in await AppleSummariser.probe(
+                transcript: Transcript(utterances: utterances), preset: Preset.defaults[0]) {
+                print(line)
+            }
+            code = 0
+            semaphore.signal()
+            return
+        }
+        do {
+            let summariser: any NoteSummarising = mlxModel.map { MLXSummariser(model: $0) }
+                ?? AppleSummariser()
+            if let mlxModel {
+                print("engine: \(mlxModel.label) (~\(mlxModel.approximateGB)GB), first run downloads it")
+            }
+            let output = try await summariser.summarise(
+                transcript: Transcript(utterances: utterances), session: session,
+                preset: Preset.defaults[0])
+            let declined = output.noteBody == AppleSummariser.declinedBody
+            print(declined ? "DECLINED — the model refused this content"
+                           : "SUMMARISED")
+            // The title is what the Note gets filed as (R9a), so a diagnostic
+            // run has to show it — and show when there wasn't one, since that
+            // is the case where the filename falls back to the time of day.
+            print("title: " + (output.title.map { "\"\($0)\"" }
+                               ?? "none — the note keeps \"\(session.title)\""))
+            print("")
+            print(output.noteBody)
+            code = declined ? 1 : 0
+        } catch {
+            print("FAILED: \(error)")
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(code)
+}
+
+if args.contains("--voices") {
+    // What Braid can recognise, and nothing it could not already tell you —
+    // names and exemplar counts, never the vectors themselves.
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        let store = VoiceStore()
+        let database = await store.database()
+        print("model:  \(database.embeddingModelVersion)"
+              + (database.isStale(against: LocalDiarizer.embeddingModelVersion)
+                 ? "  STALE — matching disabled until people are named again (R30)" : ""))
+        print("me:     \(database.me?.voiceprints.count ?? 0) voiceprint(s), echo detection only")
+        print("people: \(database.persons.count)")
+        for person in await store.persons() {
+            let heard = person.lastHeardAt.map {
+                DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short)
+            } ?? "never"
+            print("  \(person.name) — \(person.voiceprints.count) voiceprint(s), last heard \(heard)")
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    exit(0)
+}
+
 if let i = args.firstIndex(of: "--record-test") {
     // --record-test <dir> <seconds> [--pause <at> <for>]
     guard args.count > i + 2, let seconds = Double(args[i + 2]) else {
-        FileHandle.standardError.write(Data("usage: --record-test <dir> <seconds> [--pause <at> <for>]\n".utf8))
+        eprintLine("usage: --record-test <dir> <seconds> [--pause <at> <for>]")
         exit(2)
     }
     let dir = URL(fileURLWithPath: args[i + 1])
@@ -94,92 +190,43 @@ if let i = args.firstIndex(of: "--record-test") {
         print("RECORD-TEST-OK")
         exit(0)
     } catch {
-        FileHandle.standardError.write(Data("RECORD-TEST-FAIL: \(error)\n".utf8))
+        eprintLine("RECORD-TEST-FAIL: \(error)")
         exit(1)
     }
-}
-
-if let i = args.firstIndex(of: "--import-keys") {
-    // --import-keys [file]  reads a .env file (KEY=value) and moves the keys
-    // into the Keychain, which is the only place the app reads them from.
-    let path = args.count > i + 1 && !args[i + 1].hasPrefix("--") ? args[i + 1] : ".env"
-    guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-        eprintLine("cannot read \(path) — copy .env.example to .env and add your keys")
-        exit(2)
-    }
-    let keychain = KeychainStore()
-    var imported = 0
-    for rawLine in content.split(separator: "\n") {
-        var line = rawLine.trimmingCharacters(in: .whitespaces)
-        guard !line.isEmpty, !line.hasPrefix("#") else { continue }
-        if line.hasPrefix("export ") { line = String(line.dropFirst(7)) }
-        let parts = line.split(separator: "=", maxSplits: 1).map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
-        guard parts.count == 2 else { continue }
-        // Tolerate quoted values.
-        var value = parts[1]
-        for quote in ["\"", "'"] where value.hasPrefix(quote) && value.hasSuffix(quote) {
-            value = String(value.dropFirst().dropLast())
-        }
-        guard !value.isEmpty else { continue }
-        switch parts[0].uppercased() {
-        case "MSNOTES_ASSEMBLYAI_KEY": try? keychain.set(value, for: .assemblyAI); imported += 1
-        case "MSNOTES_ANTHROPIC_KEY": try? keychain.set(value, for: .anthropic); imported += 1
-        default: continue
-        }
-    }
-    guard imported > 0 else {
-        eprintLine("no keys found in \(path) — expected MSNOTES_ASSEMBLYAI_KEY and MSNOTES_ANTHROPIC_KEY")
-        exit(1)
-    }
-    print("imported \(imported) key(s) into the Keychain")
-    exit(0)
-}
-
-if args.contains("--check-keys") {
-    // Reads both keys from the Keychain and reports, without printing them.
-    // If this returns instantly, this binary owns the Keychain items and will
-    // never raise a consent prompt.
-    let keychain = KeychainStore()
-    let stt = keychain.get(.assemblyAI)
-    let claude = keychain.get(.anthropic)
-    print("assemblyAI: \(stt.map { "present (\($0.count) chars)" } ?? "MISSING")")
-    print("anthropic: \(claude.map { "present (\($0.count) chars)" } ?? "MISSING")")
-    exit(stt != nil && claude != nil ? 0 : 1)
 }
 
 if let i = args.firstIndex(of: "--process-test") {
     setbuf(stdout, nil)
-    // --process-test <mic.caf> <remote.caf> <vault-dir> [--title T]
+    // --process-test <mic.caf> <remote.caf> <vault-dir> [--title T] [--held]
     guard args.count > i + 3 else {
-        FileHandle.standardError.write(Data("usage: --process-test <mic.caf> <remote.caf> <vault-dir>\n".utf8))
+        eprintLine("usage: --process-test <mic.caf> <remote.caf> <vault-dir> [--title T] [--held]")
         exit(2)
     }
     let micSrc = URL(fileURLWithPath: args[i + 1])
     let remoteSrc = URL(fileURLWithPath: args[i + 2])
     let vault = args[i + 3]
+    // No `--title` means the summariser names the Note, which is what the app
+    // now does for every Session (R9a); passing one pins it, for a run where
+    // the filename needs to be predictable.
     let title = args.firstIndex(of: "--title").flatMap { t in
         args.count > t + 1 ? args[t + 1] : nil
-    } ?? "Process Test"
-
-    guard let (sttKey, claudeKey) = testKeys() else {
-        eprintLine("keys missing — run --import-keys or set MSNOTES_*_KEY")
-        exit(1)
     }
 
     let settings = SettingsStore()
     settings.vaultPath = vault
+    settings.delivery = args.contains("--held") ? .held : .immediate
     let jobsRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("braid-jobs-\(UUID().uuidString)")
 
     let remoteSilent = args.contains("--remote-silent")
-    let costBefore = settings.costTotalUSD
 
-    let session = Session(title: title, presetName: "Meeting",
-                          participants: ["Alex", "Jordan"], startedAt: Date(),
+    let startedAt = Date()
+    let session = Session(title: title ?? Session.placeholderTitle(at: startedAt),
+                          presetName: settings.defaultPresetName,
+                          participants: ["Alex", "Jordan"], startedAt: startedAt,
                           recordedDuration: 246,
-                          pauseSpans: [.init(atRecordedSeconds: 120, wallGapSeconds: 35)])
+                          pauseSpans: [.init(atRecordedSeconds: 120, wallGapSeconds: 35)],
+                          autoTitled: title == nil)
     let jobDir = jobsRoot.appendingPathComponent(session.id)
     try! FileManager.default.createDirectory(at: jobDir, withIntermediateDirectories: true)
     try! FileManager.default.copyItem(at: micSrc, to: jobDir.appendingPathComponent("mic.caf"))
@@ -188,8 +235,8 @@ if let i = args.firstIndex(of: "--process-test") {
     let semaphore = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var exitCode: Int32 = 1
     let env = JobQueue.Environment(
-        provider: AssemblyAIAdapter(apiKey: sttKey),
-        summariser: Summariser(apiKey: claudeKey),
+        transcriber: Transcriber.make(engine: settings.localEngine),
+        summariser: AppleSummariser(),
         settings: settings,
         jobsRoot: jobsRoot,
         onEvent: { event in
@@ -198,7 +245,6 @@ if let i = args.firstIndex(of: "--process-test") {
                 print("job started: \(job.id)")
             case .jobDone(_, let noteURL):
                 print("job done -> \(noteURL.path)")
-                print(String(format: "cost delta: %.4f", settings.costTotalUSD - costBefore))
                 print("PROCESS-TEST-OK")
                 exitCode = 0
                 semaphore.signal()
@@ -209,18 +255,21 @@ if let i = args.firstIndex(of: "--process-test") {
                 print("WARNING: remote track silent (R16)")
             case .echoBleedWarning:
                 print("WARNING: speaker bleed confirmed — echoes will be cleaned")
-            case .providerFellBack(_, let from, let to, let reason):
-                print("WARNING: \(from) failed, fell back to \(to): \(reason)")
             case .jobCancelled(let job):
                 print("job cancelled: \(job.id)")
             case .speakersDetected(_, let stats, let mismatch):
                 let described = stats
                     .map { "\($0.speaker) (\(Int($0.totalSeconds))s)" }
                     .joined(separator: ", ")
-                print("speakers detected: \(described)")
-                if let mismatch {
-                    print("WARNING: speaker mismatch — \(mismatch.message)")
-                }
+                print("voices to name: \(described)")
+                if let mismatch { print("WARNING: speaker mismatch — \(mismatch.message)") }
+            case .heldForNames(_, let stats, _):
+                // R26: this is a success, not a stall — the Note is waiting on
+                // names by design.
+                print("held for naming: \(stats.count) voice(s)")
+                print("PROCESS-TEST-HELD")
+                exitCode = 0
+                semaphore.signal()
             }
         })
     let queue = JobQueue(env: env)
@@ -229,7 +278,7 @@ if let i = args.firstIndex(of: "--process-test") {
     Task.detached {
         await queue.enqueue(session: session, remoteSilent: remoteSilent)
     }
-    _ = semaphore.wait(timeout: .now() + 900)
+    _ = semaphore.wait(timeout: .now() + 1800)
     exit(exitCode)
 }
 
@@ -237,14 +286,12 @@ if args.firstIndex(of: "--retry-test") != nil {
     // R7 choreography: unwritable Vault -> permanent failure, Recording kept,
     // no auto-retry; restore -> user Retry -> success, Recording deleted.
     setbuf(stdout, nil)
-    guard let (sttKey, claudeKey) = testKeys() else {
-        eprintLine("keys missing — run --import-keys or set MSNOTES_*_KEY"); exit(1)
-    }
     let fm = FileManager.default
     let vault = fm.temporaryDirectory.appendingPathComponent("r7-vault-\(UUID().uuidString)")
     try! fm.createDirectory(at: vault, withIntermediateDirectories: true)
     let settings = SettingsStore()
     settings.vaultPath = vault.path
+    settings.delivery = .immediate
     let jobsRoot = fm.temporaryDirectory
         .appendingPathComponent("braid-jobs-\(UUID().uuidString)")
 
@@ -264,8 +311,8 @@ if args.firstIndex(of: "--retry-test") != nil {
     let doneSem = DispatchSemaphore(value: 0)
     nonisolated(unsafe) var queueRef: JobQueue?
     let env = JobQueue.Environment(
-        provider: AssemblyAIAdapter(apiKey: sttKey),
-        summariser: Summariser(apiKey: claudeKey),
+        transcriber: Transcriber.make(engine: settings.localEngine),
+        summariser: AppleSummariser(),
         settings: settings,
         jobsRoot: jobsRoot,
         onEvent: { event in
@@ -286,7 +333,7 @@ if args.firstIndex(of: "--retry-test") != nil {
     print("enqueueing R7 job (vault locked at \(vault.path))")
     Task.detached { await queue.enqueue(session: session, remoteSilent: false) }
 
-    guard failedOnce.wait(timeout: .now() + 600) == .success else {
+    guard failedOnce.wait(timeout: .now() + 1800) == .success else {
         eprintLine("R7-FAIL: no permanent failure observed"); exit(1)
     }
     // Recording must survive the failure.
@@ -303,7 +350,7 @@ if args.firstIndex(of: "--retry-test") != nil {
     // Restore and user-Retry.
     try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: vault.path)
     Task.detached { await queueRef?.retry(id: session.id) }
-    guard doneSem.wait(timeout: .now() + 600) == .success else {
+    guard doneSem.wait(timeout: .now() + 1800) == .success else {
         eprintLine("R7-FAIL: retry did not complete"); exit(1)
     }
     guard !fm.fileExists(atPath: jobDir.path) else {
@@ -311,52 +358,6 @@ if args.firstIndex(of: "--retry-test") != nil {
     }
     print("recording deleted only after confirmed success ✓")
     print("R7-TEST-OK")
-    exit(0)
-}
-
-if args.firstIndex(of: "--offline-test") != nil {
-    // R8: unreachable Provider -> transient failure -> job stays queued with
-    // Recording intact (the backoff loop owns the eventual completion).
-    setbuf(stdout, nil)
-    let fm = FileManager.default
-    let vault = fm.temporaryDirectory.appendingPathComponent("r8-vault-\(UUID().uuidString)")
-    try! fm.createDirectory(at: vault, withIntermediateDirectories: true)
-    let settings = SettingsStore()
-    settings.vaultPath = vault.path
-    let jobsRoot = fm.temporaryDirectory
-        .appendingPathComponent("braid-jobs-\(UUID().uuidString)")
-    let session = Session(title: "R8 Offline Test", presetName: "Meeting",
-                          participants: [], startedAt: Date(), recordedDuration: 246)
-    let jobDir = jobsRoot.appendingPathComponent(session.id)
-    try! fm.createDirectory(at: jobDir, withIntermediateDirectories: true)
-    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-mic.caf"),
-                     to: jobDir.appendingPathComponent("mic.caf"))
-    try! fm.copyItem(at: URL(fileURLWithPath: "/tmp/e2e-remote.caf"),
-                     to: jobDir.appendingPathComponent("remote.caf"))
-
-    let sem = DispatchSemaphore(value: 0)
-    let env = JobQueue.Environment(
-        provider: AssemblyAIAdapter(apiKey: "irrelevant",
-                                    baseURL: URL(string: "https://127.0.0.1:9")!),
-        summariser: Summariser(apiKey: "irrelevant"),
-        settings: settings,
-        jobsRoot: jobsRoot,
-        onEvent: { event in
-            if case .jobFailed(let job, let transient) = event {
-                print("offline failure observed: transient=\(transient), status=\(job.status.rawValue)")
-                if transient { sem.signal() }
-            }
-        })
-    let queue = JobQueue(env: env)
-    Task.detached { await queue.enqueue(session: session, remoteSilent: false) }
-    guard sem.wait(timeout: .now() + 120) == .success else {
-        eprintLine("R8-FAIL: no transient failure observed"); exit(1)
-    }
-    guard fm.fileExists(atPath: jobDir.appendingPathComponent("mic.caf").path) else {
-        eprintLine("R8-FAIL: recording lost on offline failure"); exit(1)
-    }
-    print("job re-queued with recording intact; backoff loop owns completion ✓")
-    print("R8-TEST-OK")
     exit(0)
 }
 

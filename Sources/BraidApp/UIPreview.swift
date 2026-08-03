@@ -108,11 +108,15 @@ enum UIPreview {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage),
               named: "panel", into: directory)
+        // The start form is the panel now, so what is worth snapshotting is how
+        // it reads with voices to pick from and how it reads without any.
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
-                                   startFormOpen: true),
+                                   knownPeople: previewPeople,
+                                   chosenPeople: ["Sarah"]),
               named: "panel-start-form", into: directory)
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
-                                   startFormOpen: true, speakerCount: 2),
+                                   knownPeople: previewPeople,
+                                   chosenPeople: ["Sarah"], speakerCount: 2),
               named: "panel-start-form-count", into: directory)
         write(SessionsPanelPreview(sessions: [], usage: Usage.empty),
               named: "panel-empty", into: directory)
@@ -148,6 +152,13 @@ enum UIPreview {
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    route: .settings),
               named: "panel-settings", into: directory)
+        // Settings is drawers now, so closed and open are both worth seeing —
+        // the controls inside are the ones with the least room to fit.
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   knownPeople: previewPeople,
+                                   route: .settings,
+                                   openSettingsGroups: ["Notes", "Models"]),
+              named: "panel-settings-open", into: directory)
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    route: .history),
               named: "panel-history", into: directory)
@@ -202,11 +213,12 @@ enum UIPreview {
                       text: "Agreed, though I would like another week before we sign it off."),
             Utterance(speaker: "Speaker 1", start: 130, end: 150, text: "Fine by me."),
         ])
-        return NamingRecord(session: session, transcript: transcript, provider: "assemblyai",
-                            costUSD: 1.94, notePath: "/tmp/note.md",
+        return NamingRecord(session: session, transcript: transcript, engine: "apple-speech",
+                            notePath: "/tmp/note.md",
                             transcriptPath: "/tmp/transcript.md", noteHash: "",
                             speakerMismatch: Session.SpeakerCountMismatch(
-                                heard: 2, expected: 3, asserted: false))
+                                heard: 2, expected: 3, asserted: false),
+                            suggestions: ["Speaker 1": "Sarah"])
     }
 
     private static func previewJob(_ title: String, minutes: Double) -> Job {
@@ -215,8 +227,16 @@ enum UIPreview {
             remoteSilent: false)
     }
 
+    /// Names of different lengths on purpose: the chips wrap, and a row of
+    /// four short names would never show that they do.
+    private static var previewPeople: [Person] {
+        ["Sarah", "Tom", "Russell", "Anne-Marie"].map {
+            Person(name: $0, voiceprints: [])
+        }
+    }
+
     private static var previewUsage: Usage {
-        Usage(minutesUsed: 412, minuteCap: 600, costUSD: 4.82, daysLeftInMonth: 18)
+        Usage(minutesUsed: 412, sessionCount: 11)
     }
 
     /// An AppState wired to throwaway storage: a private defaults suite and
@@ -225,19 +245,23 @@ enum UIPreview {
         let scratch = FileManager.default.temporaryDirectory
             .appendingPathComponent("braid-preview")
         let defaults = UserDefaults(suiteName: "no.braid.preview") ?? .standard
-        let state = AppState(
+        // A throwaway encryption key held in memory, so a preview never reads,
+        // writes, or creates anything in the real Keychain.
+        let box = SecretBox.ephemeral()
+        return AppState(
             settings: SettingsStore(defaults: defaults),
-            transcripts: TranscriptStore(root: scratch.appendingPathComponent("transcripts")),
-            sessions: SessionIndex(url: scratch.appendingPathComponent("sessions.json")))
-        state.keysConfigured = true   // never touch the real Keychain from a preview
-        return state
+            transcripts: TranscriptStore(root: scratch.appendingPathComponent("transcripts"),
+                                         box: box),
+            sessions: SessionIndex(url: scratch.appendingPathComponent("sessions.json")),
+            voices: VoiceStore(url: scratch.appendingPathComponent("voices.dat"), box: box),
+            clips: VoiceClipStore(root: scratch.appendingPathComponent("clips")))
     }
 
     private static func sample(_ title: String, minutesAgo: Double,
                                duration: TimeInterval, cost: Double) -> SessionRecord {
         SessionRecord(id: UUID().uuidString, title: title, presetName: "Meeting",
                       startedAt: Date().addingTimeInterval(-minutesAgo * 60),
-                      recordedDuration: duration, costUSD: cost,
+                      recordedDuration: duration,
                       notePath: "/tmp/\(title).md")
     }
 
@@ -261,7 +285,11 @@ enum UIPreview {
 private struct SessionsPanelPreview: View {
     let sessions: [SessionRecord]
     let usage: Usage
-    var startFormOpen = false
+    /// The Voice Database behind the start form's chips. Empty is a real state
+    /// worth snapshotting: it is what the app looks like before it knows
+    /// anyone, and the form has to read sensibly then too.
+    var knownPeople: [Person] = []
+    var chosenPeople: Set<String> = []
     /// Fed through the real selection path, so the strict-by-default rule the
     /// snapshot shows is the one the app actually runs.
     var speakerCount: Int?
@@ -275,6 +303,7 @@ private struct SessionsPanelPreview: View {
     var confirmation: SessionsPanelModel.Confirmation?
     var route: SessionsPanelModel.Route = .main
     var awaitingNames: [NamingRecord] = []
+    var openSettingsGroups: Set<String> = []
 
     var body: some View {
         let state = UIPreview.scratchState()
@@ -289,18 +318,18 @@ private struct SessionsPanelPreview: View {
             state.currentTitle = "Another Test"
             state.recordingStartedAt = Date().addingTimeInterval(-736)
         }
+        state.knownPeople = knownPeople
         let model = SessionsPanelModel()
-        model.presetName = "Meeting"
-        model.showingStartForm = startFormOpen
+        model.chosenPeople = chosenPeople
         if let speakerCount { model.selectSpeakerCount(speakerCount) }
         model.arrowX = arrowX ?? Theme.panelWidth / 2
         model.route = route
         model.confirmation = confirmation
         model.elapsed = 736
-        model.costEstimate = 0.11
         model.autoEndIn = autoEndIn
         model.bleedWarning = bleedWarning
         model.settingsForm.load(from: state)
+        model.settingsForm.expanded = openSettingsGroups
         // A plausible speech envelope rather than noise, so the bar scaling can
         // actually be judged.
         model.levels = (0..<SessionsPanelController.barCount).map { i in

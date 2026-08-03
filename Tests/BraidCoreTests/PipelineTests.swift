@@ -15,8 +15,13 @@ import Testing
         Utterance(speaker: "A", start: 6.0, end: 8.0, text: "Second remote"),
         Utterance(speaker: "B", start: 13.0, end: 14.0, text: "First remote again"),
     ]
-    let t = mergeTranscripts(mic: mic, remote: remote, pauseSpans: [])
+    let merged = mergeTranscripts(mic: mic, remote: remote, pauseSpans: [])
+    let t = merged.transcript
     #expect(t.utterances.map(\.speaker) == ["Me", "Speaker 1", "Speaker 2", "Me", "Speaker 1"])
+    // The map back to the diarizer's own labels is what lets a recognised
+    // voice keep its identity across the renumbering.
+    #expect(merged.remoteLabels["B"] == "Speaker 1", "numbered by first appearance")
+    #expect(merged.remoteLabels["A"] == "Speaker 2")
     #expect(t.utterances.map(\.text) == [
         "Hello from me", "First remote", "Second remote", "Me again", "First remote again"])
     #expect(t.remoteSpeakers == ["Speaker 1", "Speaker 2"])
@@ -28,7 +33,7 @@ import Testing
         Utterance(speaker: "B", start: 1, end: 2, text: "early"),
         Utterance(speaker: "A", start: 5, end: 6, text: "late"),
     ]
-    let t = mergeTranscripts(mic: [], remote: remote, pauseSpans: [])
+    let t = mergeTranscripts(mic: [], remote: remote, pauseSpans: []).transcript
     #expect(t.utterances[0].speaker == "Speaker 1")
     #expect(t.utterances[1].speaker == "Speaker 2")
 }
@@ -86,11 +91,11 @@ import Testing
                           recordedDuration: 60)
     let t = Transcript(utterances: [Utterance(speaker: "Me", start: 0, end: 1, text: "x")])
     let first = try writer.write(session: session, noteBody: "# A", transcript: t,
-                                 provider: "assemblyai", costUSD: 0.1)
+                                 engine: "apple-speech")
     let second = try writer.write(session: session, noteBody: "# B", transcript: t,
-                                  provider: "assemblyai", costUSD: 0.1)
+                                  engine: "apple-speech")
     let third = try writer.write(session: session, noteBody: "# C", transcript: t,
-                                 provider: "assemblyai", costUSD: 0.1)
+                                 engine: "apple-speech")
     let base = first.noteURL.deletingPathExtension().lastPathComponent
     #expect(second.noteURL.deletingPathExtension().lastPathComponent == "\(base) 2")
     #expect(third.noteURL.deletingPathExtension().lastPathComponent == "\(base) 3")
@@ -112,11 +117,11 @@ import Testing
                           startedAt: Date(), recordedDuration: 2832)
     let t = Transcript(utterances: [Utterance(speaker: "Me", start: 0, end: 1, text: "x")])
     let written = try writer.write(session: session, noteBody: "# Note", transcript: t,
-                                   provider: "assemblyai", costUSD: 0.1234)
+                                   engine: "apple-speech")
     let note = try String(contentsOf: written.noteURL, encoding: .utf8)
     for key in ["date:", "start:", "duration: 00:47:12", "preset: Meeting",
-                "participants: [Sarah, Tom]", "provider: assemblyai",
-                "cost: 0.1234", "transcript: \"[["] {
+                "participants: [Sarah, Tom]", "engine: apple-speech",
+                "transcript: \"[["] {
         #expect(note.contains(key), "missing \(key)")
     }
     #expect(note.contains("(transcript)]]\""))
@@ -133,40 +138,7 @@ import Testing
 
 // MARK: - Cost (R14)
 
-@Test func costMatchesRateTable() {
-    let table = CostTable.current
-    // 1h Session = 1h plain Mic Track + 1h diarized Remote Track, keyterms on both.
-    let stt = table.sttCost(trackHours: 1, diarized: false, keyterms: true)
-        + table.sttCost(trackHours: 1, diarized: true, keyterms: true)
-    #expect(abs(stt - (0.26 + 0.28)) < 0.0001)
-    let claude = table.claudeCost(inputTokens: 10_000, outputTokens: 2_000)
-    #expect(abs(claude - (0.05 + 0.05)) < 0.0001)
-}
-
 // MARK: - AssemblyAI response mapping
-
-@Test func adapterMapsDiarizedUtterances() {
-    let json: [String: Any] = [
-        "status": "completed",
-        "utterances": [
-            ["speaker": "B", "start": 32.0, "end": 5082.0, "text": "Hi there"],
-            ["speaker": "A", "start": 5082.0, "end": 6610.0, "text": "Hello"],
-        ],
-    ]
-    let utterances = AssemblyAIAdapter.utterances(from: json)
-    #expect(utterances.count == 2)
-    #expect(utterances[0].speaker == "B")
-    #expect(abs(utterances[0].start - 0.032) < 0.001)
-    #expect(utterances[1].text == "Hello")
-}
-
-@Test func adapterFallsBackToPlainText() {
-    let json: [String: Any] = ["status": "completed", "text": "just words",
-                               "audio_duration": 5.0]
-    let utterances = AssemblyAIAdapter.utterances(from: json)
-    #expect(utterances.count == 1)
-    #expect(utterances[0].text == "just words")
-}
 
 // MARK: - Error taxonomy (Journey step 8)
 
@@ -180,83 +152,6 @@ import Testing
 }
 
 // MARK: - Provider request parameters (R6)
-
-@Test func remoteTrackRequestCarriesLanguageAndKeyterms() {
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: true,
-        keyTerms: ["Acme Geo", "SlopeWatch"])
-    #expect(body["language_code"] as? String == "en_au")
-    #expect(body["speech_models"] as? [String] == ["universal-3-5-pro"])
-    #expect(body["speaker_labels"] as? Bool == true)
-    #expect(body["keyterms_prompt"] as? [String] == ["Acme Geo", "SlopeWatch"])
-}
-
-@Test func micTrackRequestIsUndiarized() {
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: false, keyTerms: [])
-    #expect(body["language_code"] as? String == "en_au")
-    #expect(body["speaker_labels"] as? Bool == false)
-    #expect(body["keyterms_prompt"] == nil)
-}
-
-/// Amended R6: by default no request carries a speaker count. Capping it at
-/// Participants+1 once meant a late joiner was folded into an existing speaker.
-@Test func defaultRequestsNeverConstrainTheSpeakerCount() {
-    for diarize in [true, false] {
-        let body = AssemblyAIAdapter.requestBody(
-            audioURL: "https://example/x", diarize: diarize, keyTerms: ["Acme Geo"])
-        #expect(body["speaker_options"] == nil)
-        #expect(body["speakers_expected"] == nil)
-    }
-}
-
-/// Amended R6: an asserted count is sent as a minimum — it can fix two voices
-/// heard as one, and can never fold a late joiner into an existing speaker.
-@Test func assertedCountSendsTheMinimumOnly() throws {
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: true, keyTerms: [],
-        expectedSpeakers: Session.SpeakerExpectation(count: 3))
-    let options = try #require(body["speaker_options"] as? [String: Any])
-    #expect(options["min_speakers_expected"] as? Int == 3)
-    #expect(options["max_speakers_expected"] == nil)
-    #expect(body["speakers_expected"] == nil)
-}
-
-/// Amended R6: only the explicit strict choice adds the maximum — the setting
-/// whose label owns the late-joiner cost.
-@Test func strictAddsTheMaximum() throws {
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: true, keyTerms: [],
-        expectedSpeakers: Session.SpeakerExpectation(count: 2, strict: true))
-    let options = try #require(body["speaker_options"] as? [String: Any])
-    #expect(options["min_speakers_expected"] as? Int == 2)
-    #expect(options["max_speakers_expected"] as? Int == 2)
-}
-
-/// Amended R6: the undiarized Mic request never carries speaker fields, even
-/// when the Session asserted a count.
-@Test func micRequestNeverCarriesSpeakerFields() {
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: false, keyTerms: [],
-        expectedSpeakers: Session.SpeakerExpectation(count: 4, strict: true))
-    #expect(body["speaker_options"] == nil)
-    #expect(body["speakers_expected"] == nil)
-}
-
-/// Amended R6: Participants reach the Provider as vocabulary — the names R11
-/// needs as transcript evidence arrive spelled correctly — never as a count.
-@Test func participantsJoinTheKeyTermsDeduplicated() {
-    let session = Session(title: "Sync", presetName: "Meeting",
-                          participants: ["Sarah", "acme geo", "Tom"],
-                          startedAt: Date())
-    let merged = session.mergedKeyTerms(global: ["Acme Geo", "SlopeWatch"])
-    #expect(merged == ["Acme Geo", "SlopeWatch", "Sarah", "Tom"])
-
-    let body = AssemblyAIAdapter.requestBody(
-        audioURL: "https://example/x", diarize: true, keyTerms: merged)
-    #expect(body["keyterms_prompt"] as? [String] == ["Acme Geo", "SlopeWatch", "Sarah", "Tom"])
-    #expect(body["speaker_options"] == nil)
-}
 
 // MARK: - Speaker count mismatch (amended R6)
 
@@ -341,9 +236,9 @@ import Testing
 
 // MARK: - Cancelling a Job before it costs anything
 
-/// Records what the pipeline actually asked the cloud to do, and can be made
+/// Records what the pipeline actually asked the Engine to do, and can be made
 /// slow enough to cancel mid-flight.
-private final class SpyProvider: STTProvider, @unchecked Sendable {
+private final class SpyProvider: TrackTranscribing, @unchecked Sendable {
     struct Call: Sendable {
         let diarize: Bool
         let keyTerms: [String]
@@ -373,22 +268,34 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
         self.remoteUtterances = remoteUtterances
     }
 
-    func transcribe(track: URL, diarize: Bool, keyTerms: [String],
-                    expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance] {
+    func transcribeMic(track: URL, keyTerms: [String],
+                       wantsVoice: Bool) async throws -> TrackTranscription {
         lock.withLock {
-            _calls.append(Call(diarize: diarize, keyTerms: keyTerms,
+            _calls.append(Call(diarize: false, keyTerms: keyTerms, expectedSpeakers: nil))
+        }
+        started.continuation.yield()
+        try await Task.sleep(for: delay)
+        return TrackTranscription(
+            utterances: micUtterances ?? [Utterance(speaker: "Me", start: 0, end: 1, text: "hello")])
+    }
+
+    func transcribeRemote(track: URL, keyTerms: [String],
+                          expectedSpeakers: Session.SpeakerExpectation?,
+                          known: VoiceDatabase?) async throws -> TrackTranscription {
+        lock.withLock {
+            _calls.append(Call(diarize: true, keyTerms: keyTerms,
                                expectedSpeakers: expectedSpeakers))
         }
         started.continuation.yield()
         try await Task.sleep(for: delay)
-        guard diarize else {
-            return micUtterances ?? [Utterance(speaker: "A", start: 0, end: 1, text: "hello")]
-        }
-        if let remoteUtterances { return remoteUtterances }
-        return remoteSpeakers.enumerated().map { index, speaker in
+        let utterances = remoteUtterances ?? remoteSpeakers.enumerated().map { index, speaker in
             Utterance(speaker: speaker, start: Double(index) * 2 + 2,
                       end: Double(index) * 2 + 3, text: "line \(index)")
         }
+        let spans = utterances.map {
+            SpeakerSpan(speakerId: $0.speaker, start: $0.start, end: $0.end)
+        }
+        return TrackTranscription(utterances: utterances, spans: spans)
     }
 }
 
@@ -397,13 +304,26 @@ private final class SpyProvider: STTProvider, @unchecked Sendable {
 private final class StubSummariser: NoteSummarising, @unchecked Sendable {
     private let lock = NSLock()
     private var _transcripts: [Transcript] = []
+    private var _sessions: [Session] = []
     var transcripts: [Transcript] { lock.withLock { _transcripts } }
+    /// The Session as each call received it, so a test can see what title the
+    /// pipeline had at the moment it asked for a summary.
+    var sessions: [Session] { lock.withLock { _sessions } }
     var callCount: Int { lock.withLock { _transcripts.count } }
+    /// What this stub claims the session should be called (R9a).
+    let title: String?
+
+    init(title: String? = nil) {
+        self.title = title
+    }
 
     func summarise(transcript: Transcript, session: Session,
-                   preset: Preset) async throws -> Summariser.Output {
-        lock.withLock { _transcripts.append(transcript) }
-        return Summariser.Output(noteBody: "# Stub note", inputTokens: 100, outputTokens: 50)
+                   preset: Preset) async throws -> SummaryOutput {
+        lock.withLock {
+            _transcripts.append(transcript)
+            _sessions.append(session)
+        }
+        return SummaryOutput(noteBody: "# Stub note", title: title)
     }
 }
 
@@ -422,21 +342,28 @@ private func writeTestCAF(at url: URL, seconds: Double = 0.25) throws {
     writer.close()
 }
 
-private func makeQueueEnvironment(provider: STTProvider, root: URL,
-                                  summariser: any NoteSummarising = Summariser(apiKey: "unused"),
+private func makeQueueEnvironment(provider: any TrackTranscribing, root: URL,
+                                  summariser: any NoteSummarising = StubSummariser(),
                                   keyTerms: [String] = [],
+                                  delivery: Delivery = .immediate,
                                   onEvent: @escaping @Sendable (JobQueue.Event) -> Void = { _ in })
     -> JobQueue.Environment {
     let defaults = UserDefaults(suiteName: "no.braid.test.\(UUID().uuidString)")!
     let settings = SettingsStore(defaults: defaults)
     settings.vaultPath = root.appendingPathComponent("vault").path
     settings.keyTerms = keyTerms
+    settings.delivery = delivery
+    // An in-memory key: these tests exercise real encryption without touching
+    // the developer's Keychain.
+    let box = SecretBox.ephemeral()
     return JobQueue.Environment(
-        provider: provider,
+        transcriber: provider,
         summariser: summariser,
         settings: settings,
+        voices: VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box),
+        clips: VoiceClipStore(root: root.appendingPathComponent("clips")),
         jobsRoot: root.appendingPathComponent("jobs"),
-        transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts")),
+        transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts"), box: box),
         sessions: SessionIndex(url: root.appendingPathComponent("sessions.json")),
         onEvent: onEvent)
 }
@@ -614,8 +541,7 @@ private func makeQueueEnvironment(provider: STTProvider, root: URL,
         Session.SpeakerCountMismatch(heard: 3, expected: 2, asserted: true))
 
     // And persisted for the naming sheet.
-    let record = try #require(
-        TranscriptStore(root: root.appendingPathComponent("transcripts")).load(session.id))
+    let record = try #require(env.transcripts.load(session.id))
     #expect(record.speakerMismatch?.heard == 3)
 
     // The wiring the mismatch depends on: the asserted count reached only the
@@ -648,12 +574,13 @@ private func makeQueueEnvironment(provider: STTProvider, root: URL,
 /// Runs a Job to completion and returns everything the assertions need.
 private func runFixtureJob(
     session: Session, remoteSpeakers: [String] = ["A"], root: URL,
-    provider explicitProvider: SpyProvider? = nil
+    provider explicitProvider: SpyProvider? = nil,
+    summaryTitle: String? = nil
 ) async throws -> (noteURL: URL, events: [JobQueue.Event],
                    summariser: StubSummariser, record: NamingRecord?) {
     let provider = explicitProvider
         ?? SpyProvider(delay: .milliseconds(1), remoteSpeakers: remoteSpeakers)
-    let summariser = StubSummariser()
+    let summariser = StubSummariser(title: summaryTitle)
     let events = Mutex<[JobQueue.Event]>([])
     let done = AsyncStream<URL>.makeStream()
     let env = makeQueueEnvironment(
@@ -673,8 +600,7 @@ private func runFixtureJob(
     await queue.enqueue(session: session, remoteSilent: false)
     var iterator = done.stream.makeAsyncIterator()
     let noteURL = try #require(await iterator.next())
-    let record = TranscriptStore(root: root.appendingPathComponent("transcripts"))
-        .load(session.id)
+    let record = env.transcripts.load(session.id)
     return (noteURL, events.withLock { $0 }, summariser, record)
 }
 
@@ -1123,7 +1049,7 @@ private func makeIndex() -> (SessionIndex, URL) {
 private func record(_ title: String, at date: Date, minutes: Double,
                     cost: Double = 0) -> SessionRecord {
     SessionRecord(id: UUID().uuidString, title: title, presetName: "Meeting",
-                  startedAt: date, recordedDuration: minutes * 60, costUSD: cost,
+                  startedAt: date, recordedDuration: minutes * 60,
                   notePath: "/tmp/\(title).md")
 }
 
@@ -1154,59 +1080,24 @@ private func record(_ title: String, at date: Date, minutes: Double,
     index.add(record("also this month", at: now, minutes: 30, cost: 0.40))
     index.add(record("last month", at: lastMonth, minutes: 500, cost: 9.99))
 
-    let usage = index.usage(minuteCap: 600, now: now)
+    let usage = index.usage(now: now)
     #expect(abs(usage.minutesUsed - 120) < 0.001)
-    #expect(abs(usage.costUSD - 1.60) < 0.001)
-    #expect(abs(usage.fraction - 0.2) < 0.001)
-    #expect(!usage.isNearCap)
-    #expect(!usage.isOverCap)
+    #expect(usage.sessionCount == 2)
 }
 
-@Test func usageFlagsTheCapWithoutEverBlocking() {
-    let near = Usage(minutesUsed: 480, minuteCap: 600, costUSD: 5, daysLeftInMonth: 3)
-    #expect(near.isNearCap)
-    #expect(!near.isOverCap)
-
-    let over = Usage(minutesUsed: 700, minuteCap: 600, costUSD: 8, daysLeftInMonth: 1)
-    #expect(over.isOverCap)
-    // The bar saturates rather than overflowing.
-    #expect(over.fraction == 1)
-
-    // A cap of zero means no cap; never divide by it.
-    let uncapped = Usage(minutesUsed: 100, minuteCap: 0, costUSD: 1, daysLeftInMonth: 5)
-    #expect(uncapped.fraction == 0)
-    #expect(!uncapped.isOverCap)
-}
-
-@Test func daysLeftCountsTodayAndResetsOnTheFirst() {
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = TimeZone(identifier: "Australia/Perth")!
-    func day(_ y: Int, _ m: Int, _ d: Int) -> Date {
-        calendar.date(from: DateComponents(year: y, month: m, day: d, hour: 12))!
-    }
-    // July has 31 days.
-    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 1), calendar: calendar) == 31)
-    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 13), calendar: calendar) == 19)
-    #expect(SessionIndex.daysLeftInMonth(now: day(2026, 7, 31), calendar: calendar) == 1)
-    // February 2028 is a leap year.
-    #expect(SessionIndex.daysLeftInMonth(now: day(2028, 2, 1), calendar: calendar) == 29)
-}
-
-@Test func namingAddsToASessionsCostWithoutDuplicatingIt() throws {
+/// Naming rewrites a Session's Note, and the index must point at the note that
+/// is current rather than gaining a second entry for the same Session.
+@Test func renamingASessionReplacesItsEntryRatherThanAddingOne() throws {
     let (index, dir) = makeIndex()
     defer { try? FileManager.default.removeItem(at: dir) }
 
-    let entry = record("Client call", at: Date(), minutes: 30, cost: 0.54)
+    var entry = record("Client call", at: Date(), minutes: 30, cost: 0)
     index.add(entry)
-    index.addCost(0.10, toSessionID: entry.id)
+    entry.notePath = "/tmp/renamed.md"
+    index.add(entry)
 
     #expect(index.all().count == 1)
-    #expect(abs((index.all().first?.costUSD ?? 0) - 0.64) < 0.001)
-
-    // An unknown id is ignored rather than creating a phantom entry.
-    index.addCost(5, toSessionID: "nope")
-    #expect(index.all().count == 1)
-    #expect(abs((index.all().first?.costUSD ?? 0) - 0.64) < 0.001)
+    #expect(index.all().first?.notePath == "/tmp/renamed.md")
 }
 
 // MARK: - Naming records
@@ -1220,8 +1111,7 @@ private func record(_ title: String, at date: Date, minutes: Double,
     let session = Session(title: "Sync", presetName: "Meeting", participants: [],
                           startedAt: Date(), recordedDuration: 60)
     let t = Transcript(utterances: [Utterance(speaker: "Speaker 1", start: 0, end: 1, text: "x")])
-    let record = NamingRecord(session: session, transcript: t, provider: "assemblyai",
-                              costUSD: 0.5, notePath: "/tmp/n.md",
+    let record = NamingRecord(session: session, transcript: t, engine: "apple-speech", notePath: "/tmp/n.md",
                               transcriptPath: "/tmp/t.md", noteHash: "abc")
     store.save(record)
 
@@ -1251,13 +1141,13 @@ private func record(_ title: String, at date: Date, minutes: Double,
         Utterance(speaker: "Speaker 1", start: 0, end: 1, text: "hello"),
     ])
     let first = try writer.write(session: session, noteBody: "# Before", transcript: before,
-                                 provider: "assemblyai", costUSD: 0.1)
+                                 engine: "apple-speech")
 
     session.participants = ["Sarah"]
     let after = before.renamingSpeakers(["Speaker 1": "Sarah"])
     let second = try writer.overwrite(
         noteURL: first.noteURL, transcriptURL: first.transcriptURL, session: session,
-        noteBody: "# After", transcript: after, provider: "assemblyai", costUSD: 0.2)
+        noteBody: "# After", transcript: after, engine: "apple-speech")
 
     #expect(second.noteURL == first.noteURL)
     // No stray duplicate left behind.
@@ -1268,10 +1158,137 @@ private func record(_ title: String, at date: Date, minutes: Double,
     let note = try String(contentsOf: second.noteURL, encoding: .utf8)
     #expect(note.contains("# After"))
     #expect(note.contains("participants: [Sarah]"))
-    #expect(note.contains("cost: 0.2000"))
+    #expect(note.contains("engine: apple-speech"))
     // The wikilink still points at the transcript that was actually rewritten.
     let transcriptName = first.transcriptURL.deletingPathExtension().lastPathComponent
     #expect(note.contains("transcript: \"[[\(transcriptName)]]\""))
     let body = try String(contentsOf: second.transcriptURL, encoding: .utf8)
     #expect(body.contains("Sarah:** hello"))
+}
+
+// MARK: - The Note names itself (R9a)
+
+/// The Start form no longer asks for a title, so the Summariser supplies one
+/// and it has to reach the filename — not just the frontmatter, and not just
+/// the in-memory Session.
+@Test func theSummarysTitleBecomesTheNotesName() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("title-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let session = Session(title: "2:15pm recording", presetName: "Meeting",
+                          participants: [], startedAt: Date(),
+                          recordedDuration: 60, autoTitled: true)
+    let run = try await runFixtureJob(session: session, root: root,
+                                      summaryTitle: "Slope monitoring handover")
+
+    #expect(run.noteURL.lastPathComponent.hasSuffix("Slope monitoring handover.md"))
+    #expect(!run.noteURL.lastPathComponent.contains("recording"))
+    // The transcript companion is renamed with it, or the wikilink between the
+    // pair breaks.
+    let record = try #require(run.record)
+    #expect(record.transcriptPath.hasSuffix("Slope monitoring handover (transcript).md"))
+    #expect(record.session.title == "Slope monitoring handover")
+    // And the Session stops being open to renaming, so a later pass cannot
+    // move a note that is already filed.
+    #expect(record.session.titleIsAutomatic == false)
+}
+
+/// A Session that was titled by hand — every Session recorded before this
+/// change — keeps that title however good the model's suggestion is.
+@Test func aTitleTheOwnerChoseIsNeverOverwritten() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("title-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let session = Session(title: "Board pack review", presetName: "Meeting",
+                          participants: [], startedAt: Date(),
+                          recordedDuration: 60)   // no autoTitled: an older Session
+    let run = try await runFixtureJob(session: session, root: root,
+                                      summaryTitle: "Something else entirely")
+
+    #expect(run.noteURL.lastPathComponent.hasSuffix("Board pack review.md"))
+}
+
+/// A Summariser that declines, or returns something unusable as a filename,
+/// must still produce a Note. The placeholder is a perfectly good name.
+@Test func aSessionWithNoUsableTitleKeepsItsPlaceholder() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("title-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let session = Session(title: "9:04am recording", presetName: "Meeting",
+                          participants: [], startedAt: Date(),
+                          recordedDuration: 60, autoTitled: true)
+    let run = try await runFixtureJob(session: session, root: root, summaryTitle: nil)
+
+    #expect(run.noteURL.lastPathComponent.hasSuffix("9:04am recording.md".replacingOccurrences(
+        of: ":", with: "-")))
+}
+
+/// The Summariser is asked to name the session, so it must not be handed a
+/// title to anchor on — every model given one echoed it back instead.
+@Test func theSummariserIsNotToldTheTitleItIsSupposedToWrite() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("title-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let session = Session(title: "11:00am recording", presetName: "Meeting",
+                          participants: [], startedAt: Date(),
+                          recordedDuration: 60, autoTitled: true)
+    let run = try await runFixtureJob(session: session, root: root,
+                                      summaryTitle: "Quarterly numbers")
+
+    // It sees the placeholder, which carries no information about the content,
+    // rather than a title someone wrote.
+    let seen = try #require(run.summariser.sessions.first)
+    #expect(seen.title == "11:00am recording")
+    #expect(seen.titleIsAutomatic)
+}
+
+@Test func aModelsTitleIsTidiedOrRejected() {
+    // Everything here came off a real reply.
+    #expect(Session.cleanTitle("\"Slope monitoring handover\"") == "Slope monitoring handover")
+    #expect(Session.cleanTitle("Title: Weekly sync") == "Weekly sync")
+    #expect(Session.cleanTitle("# Budget review") == "Budget review")
+    #expect(Session.cleanTitle("**Site handover**") == "Site handover")
+    #expect(Session.cleanTitle("Pricing call.") == "Pricing call")
+    // A title with the summary trailing after it takes the first line only.
+    #expect(Session.cleanTitle("Pricing call\nThey discussed the new tiers.") == "Pricing call")
+    // Rejections, where the placeholder is the better answer.
+    #expect(Session.cleanTitle(nil) == nil)
+    #expect(Session.cleanTitle("   ") == nil)
+    #expect(Session.cleanTitle("ok") == nil)
+    #expect(Session.cleanTitle(String(repeating: "long ", count: 30)) == nil)
+    // Filename-hostile characters are the writer's problem, not this one's —
+    // it hands them on and R9's sanitiser replaces them.
+    #expect(Session.cleanTitle("Q3: pricing / margins") == "Q3: pricing / margins")
+    #expect(VaultWriter.sanitizeTitle("Q3: pricing / margins") == "Q3- pricing - margins")
+}
+
+@Test func aTitleIsReadOutOfAnOpenModelsReply() {
+    let good = """
+        {"title": "Slope monitoring handover",
+         "summary": "They handed over the site.",
+         "sections": [{"heading": "Key points", "bullets": ["Movement has settled."]}]}
+        """
+    let reply = ModelReply.parse(good)
+    #expect(reply.title == "Slope monitoring handover")
+    // The title belongs in the filename, never in the body.
+    #expect(!reply.body.contains("Slope monitoring handover"))
+    #expect(reply.body.hasPrefix("They handed over the site."))
+
+    // Malformed JSON — the failure that actually happens — still yields both.
+    let broken = """
+        {"title": "Budget review", "summary": "They went through the numbers.",
+         "sections": [{"heading": "Decisions", "bullets": ["Approved the spend."}]}
+        """
+    let salvaged = ModelReply.parse(broken)
+    #expect(salvaged.title == "Budget review")
+    #expect(salvaged.body.contains("## Decisions"))
+
+    // Prose instead of JSON: usable as a note, but there is no title in it.
+    let prose = ModelReply.parse("They talked about the roadmap and agreed to revisit it.")
+    #expect(prose.title == nil)
+    #expect(!prose.body.isEmpty)
 }

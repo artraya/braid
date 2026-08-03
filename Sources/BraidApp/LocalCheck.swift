@@ -2,48 +2,62 @@ import Foundation
 import BraidCore
 
 /// `--local-check <audio> [--reference <assemblyai.json>] [--engine parakeet|apple]`
+/// `                      [--min-turn N] [--step N] [--zero-vote]`
 ///
-/// Runs one Track through the local Adapter exactly as a Job would, and scores
-/// it against a trusted AssemblyAI response when one is given. This is the
-/// measurement the cycle asked for before local is trusted: not a leaderboard
-/// number on clean read speech, but this machine, on real call audio.
+/// Runs one Track through the real pipeline exactly as a Job would, and scores
+/// it against a trusted reference when one is given. This is the measurement
+/// the cycle asked for before local is trusted: not a leaderboard number on
+/// clean read speech, but this machine, on real call audio.
+///
+/// It also reports what Identification would decide, so the thresholds in
+/// `IdentificationConfig` are calibrated against real voices rather than
+/// guessed (R23).
 ///
 /// Prints only aggregate numbers and short excerpts — the fixtures are real
 /// meetings, so nothing here writes a transcript to disk.
 enum LocalCheck {
 
     static func run(audio: URL, reference: URL?, engine engineID: LocalEngine,
-                    minTurn: Double = 1.0, step: Double = 0.2) async -> Int32 {
+                    minTurn: Double = 0.4, step: Double = 0.1,
+                    zeroVoteReembed: Bool = false) async -> Int32 {
         let engine: any TranscriberEngine = engineID == .apple
             ? AppleSpeechEngine() : ParakeetEngine()
-        let adapter = LocalAdapter(
-            engine: engine,
-            diarizer: LocalDiarizer(minTurnSeconds: minTurn, stepRatio: step))
+        let diarizer = LocalDiarizer(minTurnSeconds: minTurn, stepRatio: step,
+                                     zeroVoteReembed: zeroVoteReembed)
+        let transcriber = Transcriber(engine: engine, diarizer: diarizer)
 
-        print("engine:   \(engineID.label) (\(engineID.providerName))")
-        print("diarizer: minTurn \(minTurn)s, stepRatio \(step)")
+        print("engine:   \(engineID.label) (\(engineID.engineName))")
+        print("diarizer: minTurn \(minTurn)s, stepRatio \(step)"
+              + (zeroVoteReembed ? ", zero-vote re-embed ON" : ""))
         print("audio:    \(audio.lastPathComponent)")
 
         let loadStart = Date()
         do {
-            try await adapter.prepare()
+            try await transcriber.prepare()
         } catch {
             print("FAILED to prepare models: \(error)")
             return 1
         }
         print(String(format: "models:   ready in %.1fs", Date().timeIntervalSince(loadStart)))
 
+        // The Voice Database as it stands, so the report says what this Mac
+        // would actually decide today.
+        let store = VoiceStore()
+        let database = await store.database()
+        let identifier = VoiceIdentifier()
+
         let start = Date()
-        let utterances: [Utterance]
+        let result: TrackTranscription
         do {
-            utterances = try await adapter.transcribe(
-                track: audio, diarize: true, keyTerms: [], expectedSpeakers: nil)
+            result = try await transcriber.transcribeRemote(
+                track: audio, keyTerms: [], expectedSpeakers: nil, known: database)
         } catch {
             print("FAILED to transcribe: \(error)")
             return 1
         }
         let elapsed = Date().timeIntervalSince(start)
 
+        let utterances = result.utterances
         let speakers = Set(utterances.map(\.speaker))
         let audioSeconds = utterances.map(\.end).max() ?? 0
         print(String(format: "time:     %.1fs for %.0fs of audio (%.0fx realtime)",
@@ -51,11 +65,11 @@ enum LocalCheck {
         print("peak RSS: \(peakMemoryMB()) MB")
         print("output:   \(utterances.count) utterances, \(speakers.count) voices")
 
-        // Diagnostic: the diarizer's own view, before alignment touches it.
-        // Tells us whether a bad attribution is the diarizer under-segmenting
-        // or the aligner putting words in the wrong turn — different fixes.
-        if let spans = try? await LocalDiarizer(minTurnSeconds: minTurn, stepRatio: step)
-            .diarize(file: audio, expected: nil) {
+        // The diarizer's own view. Tells us whether a bad attribution is the
+        // diarizer under-segmenting or the aligner putting words in the wrong
+        // turn — different fixes.
+        let spans = result.spans
+        if !spans.isEmpty {
             let distinct = Set(spans.map(\.speakerId))
             let switches = zip(spans, spans.dropFirst()).filter { $0.speakerId != $1.speakerId }.count
             print("diarizer: \(spans.count) turns, \(distinct.count) voices, \(switches) speaker changes")
@@ -63,6 +77,11 @@ enum LocalCheck {
             print(String(format: "          median turn %.1fs, shortest %.1fs",
                          median, spans.map(\.duration).min() ?? 0))
         }
+        if result.corrections > 0 {
+            print("re-attrib: \(result.corrections) turn(s) moved using known voices")
+        }
+
+        reportIdentification(result: result, database: database, identifier: identifier)
 
         guard let reference else { return 0 }
         guard let data = try? Data(contentsOf: reference),
@@ -73,8 +92,60 @@ enum LocalCheck {
         return score(utterances: utterances, reference: json)
     }
 
-    /// Compares against the Provider Braid already trusts. Not ground truth —
-    /// a reference — so the numbers are a deviation, not an error rate.
+    /// What Identification would do with these voices, and how much room the
+    /// thresholds actually have.
+    ///
+    /// The separation line is the one worth watching: it is the highest
+    /// similarity between two *different* voices in this recording, so it is a
+    /// floor the auto threshold has to clear. A threshold below it means the
+    /// app would sometimes confidently name one person as another, which R23
+    /// treats as a hard failure rather than a tuning matter.
+    private static func reportIdentification(result: TrackTranscription,
+                                             database: VoiceDatabase,
+                                             identifier: VoiceIdentifier) {
+        let voices = result.voices
+        guard !voices.isEmpty else { return }
+        let config = identifier.config
+
+        print("")
+        print("--- identification ---")
+        print(String(format: "thresholds: auto %.2f, suggest %.2f",
+                     config.autoThreshold, config.suggestThreshold))
+        print("database: \(database.persons.count) known people"
+              + (database.isStale(against: LocalDiarizer.embeddingModelVersion)
+                 ? " (STALE — matching disabled, R30)" : ""))
+
+        for voice in voices {
+            let decision: String
+            switch identifier.match(voice, in: database) {
+            case .confident(_, let name, let score):
+                decision = String(format: "auto-name \"%@\" (%.3f)", name, score)
+            case .suggestion(_, let name, let score):
+                decision = String(format: "suggest \"%@\" (%.3f)", name, score)
+            case .unknown:
+                decision = "unknown"
+            }
+            print(String(format: "  %@ — %.0fs of speech → %@",
+                         voice.speakerId, voice.seconds, decision))
+        }
+
+        var worst: Double = 0
+        for i in voices.indices {
+            for j in voices.indices where j > i {
+                worst = max(worst, Vector.cosine(voices[i].centroid, voices[j].centroid))
+            }
+        }
+        if voices.count > 1 {
+            let verdict = worst >= config.autoThreshold
+                ? "TOO LOW — two different voices in this recording score above it"
+                : "clear by \(String(format: "%.3f", config.autoThreshold - worst))"
+            print(String(format: "separation: worst different-voice similarity %.3f; auto threshold %@",
+                         worst, verdict))
+        }
+    }
+
+    /// Compares against a trusted reference. Not ground truth — a reference —
+    /// so the numbers are a deviation, not an error rate.
     private static func score(utterances: [Utterance], reference: [String: Any]) -> Int32 {
         let referenceUtterances = parseReference(reference)
         let referenceSpeakers = Set(referenceUtterances.map(\.speaker))
@@ -82,7 +153,7 @@ enum LocalCheck {
         let referenceText = (reference["text"] as? String) ?? ""
 
         print("")
-        print("--- against the AssemblyAI reference ---")
+        print("--- against the reference ---")
         print("voices:   \(Set(utterances.map(\.speaker)).count) local vs \(referenceSpeakers.count) reference")
 
         let wer = wordErrorRate(hypothesis: localText, reference: referenceText)
@@ -125,9 +196,8 @@ enum LocalCheck {
         return 0
     }
 
-    /// The reference response's utterances. Parsed here rather than through
-    /// the Adapter's own mapper, which is internal to BraidCore — a
-    /// measurement tool should not widen the library's API.
+    /// The reference response's utterances, in AssemblyAI's shape — the format
+    /// the kept fixtures happen to be in, from when the cloud produced them.
     private static func parseReference(_ json: [String: Any]) -> [Utterance] {
         guard let raw = json["utterances"] as? [[String: Any]] else { return [] }
         return raw.compactMap { u in

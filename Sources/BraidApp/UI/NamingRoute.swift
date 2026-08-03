@@ -1,12 +1,51 @@
 import SwiftUI
+import AVFoundation
+import Observation
 import BraidCore
 
-/// Put names to the voices a finished Session found.
+/// Plays a Voice Clip so naming is something you do by ear (R25).
 ///
-/// Nothing is auto-assigned: with two names typed at Start and two speakers
-/// found, guessing which is which is a coin flip, and a confidently wrong name
-/// in a note is worse than "Speaker 1". The names typed at Start appear as
-/// suggestions instead.
+/// One player for the whole route: starting a second clip stops the first,
+/// because two voices at once is the one thing that would make this harder
+/// rather than easier.
+@MainActor
+@Observable
+final class ClipPlayer {
+    private var player: AVAudioPlayer?
+    private(set) var playing: String?
+
+    func toggle(_ speaker: String, url: URL) {
+        if playing == speaker {
+            stop()
+            return
+        }
+        stop()
+        guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
+        self.player = player
+        playing = speaker
+        player.play()
+        // No delegate: the clip is at most eight seconds, so a timer to clear
+        // the highlight is simpler than a delegate object and cannot outlive
+        // the view in a way that matters.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(player.duration + 0.1))
+            if self?.playing == speaker { self?.playing = nil }
+        }
+    }
+
+    func stop() {
+        player?.stop()
+        player = nil
+        playing = nil
+    }
+}
+
+/// Put names to the voices a Session found.
+///
+/// Braid never guesses among voices (R23): a chip is offered when the Voice
+/// Database recognises someone, and everything else is a suggestion the user
+/// confirms. Naming teaches the database, so the next call with the same person
+/// needs none of this.
 struct NamingRoute: View {
     let state: AppState
     let model: SessionsPanelModel
@@ -24,7 +63,7 @@ struct NamingRoute: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            PanelHeader(title: "Name speakers", back: { model.goToMain() })
+            PanelHeader(title: "Name voices", back: { model.goToMain() })
             if let record {
                 content(for: record)
             } else {
@@ -34,13 +73,20 @@ struct NamingRoute: View {
             }
         }
         .padding(Theme.padding)
+        .onDisappear { model.clipPlayer.stop() }
     }
 
     @ViewBuilder
     private func content(for record: NamingRecord) -> some View {
+        // Voices Braid recognised are listed too, with their name filled in.
+        // They need no attention, but an auto-name is the one thing that can be
+        // confidently wrong, so there has to be somewhere to correct it — and
+        // correcting it removes the Voiceprint that caused it (R24).
         let stats = record.transcript.remoteSpeakerStats()
+            .filter { $0.speaker != "Me (echo)" }
+        let unnamed = stats.filter { $0.speaker.hasPrefix("Speaker ") }.count
 
-        Text("\(record.session.title) — \(stats.count) voice\(stats.count == 1 ? "" : "s") on the far end. Name the ones you recognise and leave the rest.")
+        Text(header(for: record, unnamed: unnamed))
             .font(.system(size: 11))
             .foregroundStyle(Theme.dim)
             .fixedSize(horizontal: false, vertical: true)
@@ -61,11 +107,18 @@ struct NamingRoute: View {
         ScrollView {
             VStack(spacing: 10) {
                 ForEach(stats) { stat in
+                    let recognised = !stat.speaker.hasPrefix("Speaker ")
                     SpeakerRow(
                         stat: stat,
-                        suggestions: record.session.participants,
+                        recognised: recognised,
+                        chips: chips(for: stat.speaker, record: record),
+                        clip: state.clips.clip(for: stat.speaker, sessionID: sessionID),
+                        player: model.clipPlayer,
                         name: Binding(
-                            get: { model.namingNames[stat.speaker] ?? "" },
+                            // A recognised voice shows the name it was given, so
+                            // changing it is an edit rather than a fresh guess.
+                            get: { model.namingNames[stat.speaker]
+                                    ?? (recognised ? stat.speaker : "") },
                             set: { model.namingNames[stat.speaker] = $0 }))
                 }
             }
@@ -76,22 +129,37 @@ struct NamingRoute: View {
         if let error = model.namingError {
             Text(error).font(.system(size: 11)).foregroundStyle(Theme.recording).lineLimit(3)
         } else {
-            Text("Rewrites the note and transcript. About 10c.")
+            Text(record.isDelivered
+                 ? "Rewrites the note and transcript, and remembers these voices for next time."
+                 : "Writes the note, and remembers these voices for next time.")
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.faint)
+                .fixedSize(horizontal: false, vertical: true)
         }
 
         HStack(spacing: 10) {
-            Button("Not now") { model.goToMain() }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Theme.dim)
-                .disabled(model.namingWorking)
+            // R25: skipping resolves the Session. For a Held one that means
+            // delivering with generic labels, so the button has to say so.
+            Button(record.isDelivered ? "Not now" : "Write it without names") {
+                if record.isDelivered {
+                    model.goToMain()
+                } else {
+                    actions.skipNaming(sessionID)
+                }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Theme.dim)
+            .disabled(model.namingWorking)
+
             Spacer()
+
             Button {
                 actions.applyNames(sessionID)
             } label: {
-                Text(model.namingWorking ? "Rewriting…" : "Apply")
+                Text(model.namingWorking
+                     ? (record.isDelivered ? "Rewriting…" : "Writing…")
+                     : "Apply")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.text)
                     .padding(.vertical, 9)
@@ -103,11 +171,42 @@ struct NamingRoute: View {
             .disabled(model.namingWorking || !hasAnyName)
         }
     }
+
+    private func header(for record: NamingRecord, unnamed: Int) -> String {
+        let voices = "\(unnamed) voice\(unnamed == 1 ? "" : "s")"
+        return record.isDelivered
+            ? "\(record.session.title) — \(voices) Braid did not recognise. Name the ones you know and leave the rest."
+            : "\(record.session.title) — the note is waiting on \(voices). Name them, or write it without."
+    }
+
+    /// Suggestion order (SPEC Design): what the voice matched, then the names
+    /// typed at Start, then people heard recently. Deduplicated, first wins.
+    private func chips(for speaker: String, record: NamingRecord) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        func add(_ name: String) {
+            let trimmed = name.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, seen.insert(trimmed.lowercased()).inserted else { return }
+            out.append(trimmed)
+        }
+        if let matched = record.suggestions[speaker] { add(matched) }
+        record.session.participants.forEach(add)
+        state.knownPeople
+            .sorted { ($0.lastHeardAt ?? .distantPast) > ($1.lastHeardAt ?? .distantPast) }
+            .prefix(4)
+            .forEach { add($0.name) }
+        return out
+    }
 }
 
 private struct SpeakerRow: View {
     let stat: Transcript.SpeakerStat
-    let suggestions: [String]
+    /// Braid put this name here itself, so the row reads as confirmable rather
+    /// than as a question.
+    let recognised: Bool
+    let chips: [String]
+    let clip: URL?
+    let player: ClipPlayer
     let name: Binding<String>
 
     private var turns: String {
@@ -117,34 +216,60 @@ private struct SpeakerRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                if let clip {
+                    Button {
+                        player.toggle(stat.speaker, url: clip)
+                    } label: {
+                        Image(systemName: player.playing == stat.speaker
+                              ? "stop.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 16))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Hear this voice")
+                }
                 Text(stat.speaker)
                     .font(.system(size: 12, weight: .bold, design: .rounded))
                     .foregroundStyle(Theme.text)
                 Text("\(Transcript.gap(stat.totalSeconds)) · \(turns)")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.faint)
+                if recognised {
+                    Text("recognised")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                        .padding(.vertical, 2)
+                        .padding(.horizontal, 6)
+                        .background(Theme.accent.opacity(0.16), in: Capsule())
+                }
             }
             Text("\u{201C}\(stat.sample)\u{201D}")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.dim)
                 .italic()
                 .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: 6) {
-                TextField("Name", text: name)
-                    .textFieldStyle(.roundedBorder)
-                if !suggestions.isEmpty {
-                    Menu {
-                        ForEach(suggestions, id: \.self) { suggestion in
-                            Button(suggestion) { name.wrappedValue = suggestion }
-                        }
-                    } label: {
-                        Image(systemName: "person.crop.circle")
+
+            if !chips.isEmpty {
+                // One tap is the whole point: the common case is a name Braid
+                // already has a reason to offer.
+                HStack(spacing: 5) {
+                    ForEach(chips.prefix(4), id: \.self) { chip in
+                        Button(chip) { name.wrappedValue = chip }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(name.wrappedValue == chip ? Theme.text : Theme.accent)
+                            .padding(.vertical, 3)
+                            .padding(.horizontal, 8)
+                            .background(name.wrappedValue == chip
+                                        ? Theme.accent : Color.white.opacity(0.06),
+                                        in: Capsule())
                     }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 26)
-                    .help("Participants you named at the start")
                 }
             }
+
+            TextField("Name", text: name)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11))
         }
         .padding(10)
         .background(Theme.card,

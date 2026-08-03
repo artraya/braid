@@ -45,8 +45,15 @@ public struct Session: Sendable, Codable, Identifiable {
     }
 
     public var id: String
-    /// Optional user title from the Start popover; defaults to the Preset name.
+    /// What the Note is called. Starts as the time of day and is replaced by a
+    /// title the Summariser derives from the conversation (R9a) — the Start
+    /// form no longer asks for one, because a title typed before a meeting
+    /// describes what you expected rather than what happened.
     public var title: String
+    /// True while `title` is still the automatic stand-in and a Summariser is
+    /// allowed to replace it. Optional so Sessions persisted before this field
+    /// decode as false and keep the title their owner typed.
+    public var autoTitled: Bool?
     public var presetName: String
     /// Optional per-Session names, Summariser hints only (never sent as identities).
     public var participants: [String]
@@ -71,7 +78,8 @@ public struct Session: Sendable, Codable, Identifiable {
         expectedSpeakers: SpeakerExpectation? = nil,
         startedAt: Date,
         recordedDuration: TimeInterval = 0,
-        pauseSpans: [Transcript.PauseMarker] = []
+        pauseSpans: [Transcript.PauseMarker] = [],
+        autoTitled: Bool? = nil
     ) {
         self.id = id
         self.title = title
@@ -81,6 +89,53 @@ public struct Session: Sendable, Codable, Identifiable {
         self.startedAt = startedAt
         self.recordedDuration = recordedDuration
         self.pauseSpans = pauseSpans
+        self.autoTitled = autoTitled
+    }
+
+    /// What a Session is called before anything has been transcribed: the time
+    /// it started. It shows in the panel and in the menu bar while the Session
+    /// records and processes, and never reaches the Vault — by the time a Note
+    /// is written the Summariser has supplied a real title, or `cleanTitle`
+    /// has rejected what it offered and this stands in.
+    public static func placeholderTitle(at date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_AU")
+        fmt.timeZone = .current
+        fmt.dateFormat = "h:mma"
+        return "\(fmt.string(from: date).lowercased()) recording"
+    }
+
+    /// Whether a Summariser may replace this title.
+    public var titleIsAutomatic: Bool { autoTitled ?? false }
+
+    /// Makes a model's suggested title fit for a filename, or rejects it.
+    ///
+    /// Everything here was seen in a real reply: quotes around the whole thing,
+    /// a trailing full stop, a `Title:` prefix echoing the request, a newline
+    /// with the summary after it, and — the one that matters — a title so long
+    /// it was really the first sentence of the summary. Rejecting is safe: the
+    /// placeholder is a perfectly good name for a note.
+    public static func cleanTitle(_ raw: String?) -> String? {
+        guard var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        if let firstLine = text.components(separatedBy: "\n").first { text = firstLine }
+        for prefix in ["Title:", "title:", "#"] where text.hasPrefix(prefix) {
+            text = String(text.dropFirst(prefix.count))
+        }
+        text = text.trimmingCharacters(in: .whitespaces)
+        // Paired wrapping quotes, straight or curly.
+        for pair in [("\"", "\""), ("'", "'"), ("\u{201C}", "\u{201D}")]
+        where text.hasPrefix(pair.0) && text.hasSuffix(pair.1) && text.count > 2 {
+            text = String(text.dropFirst().dropLast())
+        }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: " .*_"))
+        // Newlines are already gone; other control characters would break a
+        // filename just as thoroughly.
+        text = text.components(separatedBy: .controlCharacters).joined(separator: " ")
+        text = text.replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        guard text.count >= 3, text.count <= 80 else { return nil }
+        return text
     }
 
     /// Key Terms for both Provider requests: the global list plus this

@@ -35,6 +35,20 @@ public struct SettingsStore: Sendable {
         }
     }
 
+    /// Which Preset shapes every Note. Chosen once in Settings rather than
+    /// before each recording: the panel asks nothing at Start that Braid can
+    /// work out for itself, and in practice one shape fits nearly every
+    /// session. Falls back to the first Preset when the named one is gone.
+    public var defaultPresetName: String {
+        get {
+            let stored = defaults.string(forKey: "defaultPresetName")
+            let available = presets
+            if let stored, available.contains(where: { $0.name == stored }) { return stored }
+            return available.first?.name ?? "Meeting"
+        }
+        nonmutating set { defaults.set(newValue, forKey: "defaultPresetName") }
+    }
+
     /// Stop recording by itself when the call app lets go of the microphone.
     /// Starting is always deliberate; only stopping is automated (R17).
     public var autoEndEnabled: Bool {
@@ -80,5 +94,24 @@ public struct SettingsStore: Sendable {
     public var localModelsInstalled: Bool {
         get { defaults.bool(forKey: "localModelsInstalled") }
         nonmutating set { defaults.set(newValue, forKey: "localModelsInstalled") }
+    }
+
+    /// Which model writes the Note. Apple's by default: it is already on the
+    /// machine and costs nothing, and most sessions summarise fine with it.
+    public var summaryEngine: SummaryEngine {
+        get {
+            guard let raw = defaults.string(forKey: "summaryEngine"),
+                  let engine = SummaryEngine(rawValue: raw) else { return .appleBuiltIn }
+            return engine
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: "summaryEngine") }
+    }
+
+    /// The open-weights model's Hugging Face id, held as a plain string because
+    /// BraidCore does not know about MLX — the dependency sits at the edge, in
+    /// BraidMLX, and only the app layer maps this to a model.
+    public var openWeightsModel: String {
+        get { defaults.string(forKey: "openWeightsModel") ?? "mlx-community/Qwen3-4B-4bit" }
+        nonmutating set { defaults.set(newValue, forKey: "openWeightsModel") }
     }
 }

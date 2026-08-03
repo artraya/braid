@@ -21,13 +21,35 @@ final class SessionsPanelModel {
     }
 
     var route: Route = .main
-    var showingStartForm = false
-    var title = ""
-    var participants = ""
-    var presetName = ""
+    /// Names ticked from the Voice Database. Held as names rather than Person
+    /// ids because that is what a Session stores and what the Summariser is
+    /// given; nothing downstream cares which record they came from.
+    var chosenPeople: Set<String> = []
+    /// Someone not in the database yet, typed in before the call.
+    var addedNames: [String] = []
+    var typedName = ""
     /// nil = Auto: the Provider decides how many voices it hears (amended R6).
     var speakerCount: Int?
     var speakersStrict = false
+
+    /// Everyone the Session should expect, in a stable order: known voices in
+    /// the order the database lists them, then anyone typed.
+    func participants(known: [Person]) -> [String] {
+        known.map(\.name).filter { chosenPeople.contains($0) } + addedNames
+    }
+
+    /// Commits whatever is in the add field. Duplicates of a known voice fold
+    /// into the tick rather than appearing twice.
+    func commitTypedName(known: [Person]) {
+        let name = typedName.trimmingCharacters(in: .whitespaces)
+        typedName = ""
+        guard !name.isEmpty else { return }
+        if known.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            chosenPeople.insert(name)
+        } else if !addedNames.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+            addedNames.append(name)
+        }
+    }
 
     /// Picking a count means exactly that count unless the user unticks it
     /// (owner decision 2026-08-01); Auto stays the late-joiner-tolerant choice.
@@ -43,7 +65,6 @@ final class SessionsPanelModel {
     // Live recording readout, ticked by the controller while the panel is open.
     var elapsed: TimeInterval = 0
     var levels: [Float] = []
-    var costEstimate: Double = 0
     /// Seconds until the Session stops by itself, or nil when nothing is pending.
     var autoEndIn: Int?
     /// Speaker-bleed line in the recording block, nil when all is well.
@@ -68,16 +89,17 @@ final class SessionsPanelModel {
     var namingNames: [String: String] = [:]
     var namingWorking = false
     var namingError: String?
+    /// Shared across the naming rows so only one Voice Clip plays at a time.
+    let clipPlayer = ClipPlayer()
 
     let settingsForm = SettingsFormModel()
 
-    func resetForm(defaultPreset: String) {
-        title = ""
-        participants = ""
-        presetName = defaultPreset
+    func resetForm() {
+        chosenPeople = []
+        addedNames = []
+        typedName = ""
         speakerCount = nil
         speakersStrict = false
-        showingStartForm = false
     }
 
     func goToMain() {
@@ -86,6 +108,7 @@ final class SessionsPanelModel {
         namingNames = [:]
         namingError = nil
         namingWorking = false
+        clipPlayer.stop()
     }
 
 }
@@ -103,6 +126,7 @@ struct PanelActions {
     var retryJob: (String) -> Void = { _ in }
     var deleteJob: (String) -> Void = { _ in }
     var applyNames: (String) -> Void = { _ in }
+    var skipNaming: (String) -> Void = { _ in }
     var chooseVault: () -> Void = {}
     var saveSettings: () -> Void = {}
     var quit: () -> Void = {}
@@ -149,10 +173,13 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     func show(from button: NSStatusBarButton?, route: SessionsPanelModel.Route = .main) {
         state.refreshSessions()
         state.refreshNamingState()
+        // The chips are the whole start form now, so they have to be current
+        // before the panel is on screen rather than a frame later.
+        state.refreshPeople()
         if model.route != route { model.goToMain() }
         model.route = route
         if route == .settings { model.settingsForm.load(from: state) }
-        model.resetForm(defaultPreset: state.settings.presets.first?.name ?? "Meeting")
+        model.resetForm()
         tick()
 
         let panel = self.panel ?? makePanel()
@@ -224,7 +251,6 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
             return
         }
         model.levels = state.engine.levels.recent(Self.barCount)
-        model.costEstimate = state.liveCostEstimate
         model.bleedWarning = state.bleedWarning
         if let startedAt = state.recordingStartedAt, state.phase == .recording {
             model.elapsed = Date().timeIntervalSince(startedAt)
@@ -265,6 +291,7 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
             retryJob: { [weak self] id in self?.state.retry(jobID: id) },
             deleteJob: { [weak self] id in self?.askToDeleteJob(id) },
             applyNames: { [weak self] id in self?.applyNames(to: id) },
+            skipNaming: { [weak self] id in self?.skipNaming(id) },
             chooseVault: { [weak self] in self?.chooseVault() },
             saveSettings: { [weak self] in self?.saveSettings() },
             quit: { NSApp.terminate(nil) })
@@ -273,12 +300,13 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
     // MARK: - Actions
 
     private func start() {
-        state.start(title: model.title,
-                    presetName: model.presetName,
-                    participants: model.participants,
+        // Whatever is half-typed in the add field counts: pressing Start with
+        // a name still in it should not silently drop that name.
+        model.commitTypedName(known: state.knownPeople)
+        state.start(participants: model.participants(known: state.knownPeople),
                     speakerCount: model.speakerCount,
                     speakersStrict: model.speakersStrict)
-        model.resetForm(defaultPreset: state.settings.presets.first?.name ?? "Meeting")
+        model.resetForm()
         tick()
         startTicking()
     }
@@ -325,6 +353,16 @@ final class SessionsPanelController: NSObject, NSWindowDelegate {
                 self.model.namingError = "\(error)"
             }
         }
+    }
+
+    /// R25: skipping resolves Identification. A Held Session delivers with the
+    /// generic labels it has; a delivered one simply stops asking.
+    private func skipNaming(_ sessionID: String) {
+        model.namingWorking = true
+        model.namingError = nil
+        state.skipNaming(sessionID: sessionID)
+        model.namingWorking = false
+        model.goToMain()
     }
 
     private func chooseVault() {
@@ -435,14 +473,17 @@ private struct MainRoute: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // The form is here from the first click rather than behind a
+            // Record button that only revealed it. Two clicks to start a
+            // recording is one too many when the second one is the same button
+            // wearing a different label.
             if !recording {
-                if model.showingStartForm {
-                    StartForm(state: state, model: model, onStart: actions.start)
-                }
+                StartForm(state: state, model: model, onStart: actions.start)
                 recordButton
             }
         }
         .padding(Theme.padding)
+        .onAppear { state.refreshPeople() }
     }
 
     /// Work that has not been paid for yet, with the way to stop it. This sits
@@ -483,18 +524,12 @@ private struct MainRoute: View {
     }
 
     private var recordButton: some View {
-        Button {
-            if model.showingStartForm {
-                actions.start()
-            } else {
-                model.showingStartForm = true
-            }
-        } label: {
+        Button(action: actions.start) {
             HStack(spacing: 8) {
                 Circle()
-                    .fill(model.showingStartForm ? Theme.text : Color.black.opacity(0.75))
+                    .fill(Theme.text)
                     .frame(width: 9, height: 9)
-                Text(model.showingStartForm ? "Start recording" : "Record")
+                Text("Start recording")
                     .font(.system(size: 14, weight: .semibold))
             }
             .foregroundStyle(Theme.text)
@@ -517,6 +552,9 @@ private struct HistoryRoute: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             PanelHeader(title: "History", back: { model.goToMain() })
+            // The month's total lives here rather than in Settings: it is
+            // something to look at, not something to set.
+            UsageCard(usage: state.usage)
             if state.recentSessions.isEmpty {
                 Text("No sessions yet. Record one and the note lands in your vault.")
                     .font(.system(size: 12))

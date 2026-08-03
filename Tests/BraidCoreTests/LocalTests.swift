@@ -5,9 +5,9 @@ import FluidAudio
 
 // MARK: - Alignment
 //
-// The step ADR-0002 parked local diarization over. These tests are where the
-// confidence in local attribution actually lives: they run without a model, so
-// they can assert exactly rather than approximately.
+// These tests are where the confidence in local attribution actually lives:
+// they run without a model, so they can assert exactly rather than
+// approximately.
 
 @Test func alignerPutsEachWordWithWhoeverWasTalking() {
     let words = [
@@ -99,26 +99,43 @@ import FluidAudio
     #expect(ParakeetEngine.words(from: nil).isEmpty)
 }
 
-// MARK: - The local Adapter
+// MARK: - The Transcriber (R6, R22)
 
-@Test func localAdapterLabelsTheMicTrackMeAndNeverDiarizesIt() async throws {
+@Test func micTrackIsNeverDiarized() async throws {
     let engine = StubEngine(words: [
         TimedWord(text: "my", start: 0, end: 0.3),
         TimedWord(text: "turn", start: 0.3, end: 0.6),
     ])
     let diarizer = StubDiarizer(spans: [])
-    let adapter = LocalAdapter(engine: engine, diarizer: diarizer)
+    let transcriber = Transcriber(engine: engine, diarizer: diarizer)
 
-    let utterances = try await adapter.transcribe(
-        track: URL(fileURLWithPath: "/tmp/mic.caf"), diarize: false,
-        keyTerms: [], expectedSpeakers: nil)
+    let result = try await transcriber.transcribeMic(
+        track: URL(fileURLWithPath: "/tmp/mic.caf"), keyTerms: [], wantsVoice: false)
 
-    #expect(utterances.allSatisfy { $0.speaker == "Me" })
-    #expect(utterances.map(\.text) == ["my turn"])
+    #expect(result.utterances.allSatisfy { $0.speaker == "Me" })
+    #expect(result.utterances.map(\.text) == ["my turn"])
     #expect(diarizer.callCount == 0, "the Mic Track is one speaker structurally (ADR-0001)")
 }
 
-@Test func localAdapterSeparatesRemoteVoicesAndPassesTheAssertedCountThrough() async throws {
+/// R28: the one time the Mic Track meets the diarizer, it is pinned to exactly
+/// one speaker — an embedding of the owner, never a split.
+@Test func learningMeAsksForExactlyOneSpeaker() async throws {
+    let engine = StubEngine(words: [TimedWord(text: "mine", start: 0, end: 1)])
+    let diarizer = StubDiarizer(
+        spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 30)],
+        voices: [SpeakerVoice(speakerId: "S0", centroid: unitVector(seed: 1), seconds: 30)])
+    let transcriber = Transcriber(engine: engine, diarizer: diarizer)
+
+    let result = try await transcriber.transcribeMic(
+        track: URL(fileURLWithPath: "/tmp/mic.caf"), keyTerms: [], wantsVoice: true)
+
+    #expect(diarizer.received?.count == 1)
+    #expect(diarizer.received?.strict == true, "pinned to one voice, so it cannot be split")
+    #expect(result.voices.count == 1)
+    #expect(result.voices.first?.speakerId == "Me")
+}
+
+@Test func engineReceivesKeyTermsAndDiarizerTheAssertedCount() async throws {
     let engine = StubEngine(words: [
         TimedWord(text: "first", start: 0.0, end: 0.5),
         TimedWord(text: "second", start: 2.0, end: 2.5),
@@ -127,14 +144,14 @@ import FluidAudio
         SpeakerSpan(speakerId: "S0", start: 0, end: 1),
         SpeakerSpan(speakerId: "S1", start: 1.8, end: 3),
     ])
-    let adapter = LocalAdapter(engine: engine, diarizer: diarizer)
+    let transcriber = Transcriber(engine: engine, diarizer: diarizer)
     let expectation = Session.SpeakerExpectation(count: 2, strict: true)
 
-    let utterances = try await adapter.transcribe(
-        track: URL(fileURLWithPath: "/tmp/remote.caf"), diarize: true,
-        keyTerms: ["Terrafix"], expectedSpeakers: expectation)
+    let result = try await transcriber.transcribeRemote(
+        track: URL(fileURLWithPath: "/tmp/remote.caf"), keyTerms: ["Terrafix"],
+        expectedSpeakers: expectation, known: nil)
 
-    #expect(Set(utterances.map(\.speaker)).count == 2)
+    #expect(Set(result.utterances.map(\.speaker)).count == 2)
     #expect(diarizer.received?.count == 2)
     #expect(diarizer.received?.strict == true)
     #expect(engine.receivedKeyTerms == ["Terrafix"])
@@ -142,167 +159,30 @@ import FluidAudio
 
 /// An engine that produces text but no timings must not have positions
 /// invented for it. One honest block beats words scattered by guesswork.
-@Test func localAdapterFallsBackToOneBlockWithoutTimings() async throws {
+@Test func pipelineFallsBackToOneBlockWithoutTimings() async throws {
     let engine = StubEngine(words: [], text: "no timings here", duration: 12)
-    let adapter = LocalAdapter(engine: engine, diarizer: StubDiarizer(spans: []))
+    let transcriber = Transcriber(engine: engine, diarizer: StubDiarizer(spans: []))
 
-    let utterances = try await adapter.transcribe(
-        track: URL(fileURLWithPath: "/tmp/remote.caf"), diarize: true,
-        keyTerms: [], expectedSpeakers: nil)
+    let result = try await transcriber.transcribeRemote(
+        track: URL(fileURLWithPath: "/tmp/remote.caf"), keyTerms: [],
+        expectedSpeakers: nil, known: nil)
 
-    #expect(utterances.count == 1)
-    #expect(utterances[0].text == "no timings here")
-    #expect(utterances[0].end == 12)
+    #expect(result.utterances.count == 1)
+    #expect(result.utterances[0].text == "no timings here")
+    #expect(result.utterances[0].end == 12)
 }
 
-@Test func localAdapterReadsOriginalsAndCostsNothingToRun() {
-    let adapter = LocalAdapter(engine: StubEngine(words: []), diarizer: StubDiarizer(spans: []))
-    #expect(adapter.isLocal)
-    #expect(adapter.prefersCompressedUpload == false, "FLAC exists for uploads; local reads the CAF")
-    #expect(AssemblyAIAdapter(apiKey: "x").prefersCompressedUpload, "the cloud path is unchanged")
-    #expect(AssemblyAIAdapter(apiKey: "x").isLocal == false)
-}
-
-// MARK: - Modes, fallback and disclosure
-//
-// Audio going somewhere the user did not ask for is the worst bug this app
-// could have, so these assert the routing rather than trusting it.
-
-/// Auto: local fails, the cloud delivers, and the Note says so. The fallback
-/// is allowed precisely because it is never quiet.
-@Test func autoFallsBackToTheCloudAndTheNoteNamesTheProviderThatRan() async throws {
-    let root = tempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    let brokenLocal = LocalAdapter(
-        engine: StubEngine(words: [], failure: LocalEngineError.modelsUnavailable("not downloaded")),
-        diarizer: StubDiarizer(spans: []))
-    let cloud = SimpleProvider(name: "assemblyai")
-    let disclosed = Disclosures()
-    let env = try makeLocalEnvironment(provider: brokenLocal, fallback: cloud, root: root) { event in
-        disclosed.record(event)
-    }
-    let queue = JobQueue(env: env)
-    let session = try seedSession(root: root)
-
-    await queue.enqueue(session: session, remoteSilent: false)
-    let note = try await disclosed.waitForNote()
-
-    #expect(cloud.callCount == 2, "both Tracks re-run on the fallback, never a mixed Note")
-    #expect(disclosed.fellBackTo == "assemblyai")
-    let frontmatter = try String(contentsOf: note, encoding: .utf8)
-    #expect(frontmatter.contains("provider: assemblyai"))
-    #expect(!frontmatter.contains("local-parakeet"))
-}
-
-/// Local mode has no fallback in its Environment at all, so there is nothing
-/// for a failure to reach. The Job parks for the user instead.
-@Test func localModeNeverReachesTheCloudWhenItFails() async throws {
-    let root = tempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    let brokenLocal = LocalAdapter(
-        engine: StubEngine(words: [], failure: LocalEngineError.modelsUnavailable("not downloaded")),
-        diarizer: StubDiarizer(spans: []))
-    let cloud = SimpleProvider(name: "assemblyai")
-    let disclosed = Disclosures()
-    // fallback: nil is the point of this test.
-    let env = try makeLocalEnvironment(provider: brokenLocal, fallback: nil, root: root) { event in
-        disclosed.record(event)
-    }
-    let queue = JobQueue(env: env)
-    let session = try seedSession(root: root)
-
-    await queue.enqueue(session: session, remoteSilent: false)
-    try await disclosed.waitForFailure()
-
-    #expect(cloud.callCount == 0, "no audio may leave the machine in Local mode")
-    #expect(disclosed.fellBackTo == nil)
-    let failed = await queue.failedJobs()
-    #expect(failed.count == 1)
-    // R7: a failed Job keeps its Recording.
-    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
-    #expect(FileManager.default.fileExists(atPath: dir.path))
-}
-
-/// A locally transcribed Session bills for the summary and nothing else.
-@Test func localDeliveryAddsNoTranscriptionCost() async throws {
-    let root = tempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    let local = LocalAdapter(
-        engine: StubEngine(words: [TimedWord(text: "hello", start: 0, end: 1)]),
-        diarizer: StubDiarizer(spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 1)]))
-    let disclosed = Disclosures()
-    let env = try makeLocalEnvironment(provider: local, fallback: nil, root: root,
-                                       summariser: StubSummary()) { disclosed.record($0) }
-    let queue = JobQueue(env: env)
-    let session = try seedSession(root: root, duration: 3600)
-
-    await queue.enqueue(session: session, remoteSilent: false)
-    _ = try await disclosed.waitForNote()
-
-    // An hour of cloud audio would be about $0.54 across two Tracks; here the
-    // only cost is the summary's tokens.
-    let expectedSummaryOnly = CostTable.current.claudeCost(inputTokens: 100, outputTokens: 50)
-    #expect(abs(env.settings.costTotalUSD - expectedSummaryOnly) < 0.0001)
-}
-
-/// ADR-0003, enforced rather than promised. `SpeakerSpan` has no embedding
-/// field, so nothing the diarizer clustered on can reach disk — this checks
-/// the persisted state actually bears that out.
-@Test func noVoiceprintSurvivesACompletedLocalJob() async throws {
-    let root = tempRoot()
-    defer { try? FileManager.default.removeItem(at: root) }
-
-    let local = LocalAdapter(
-        engine: StubEngine(words: [
-            TimedWord(text: "hello", start: 0, end: 0.5),
-            TimedWord(text: "there", start: 2.0, end: 2.5),
-        ]),
-        diarizer: StubDiarizer(spans: [
-            SpeakerSpan(speakerId: "S0", start: 0, end: 1),
-            SpeakerSpan(speakerId: "S1", start: 1.8, end: 3),
-        ]))
-    let disclosed = Disclosures()
-    let env = try makeLocalEnvironment(provider: local, fallback: nil, root: root,
-                                       summariser: StubSummary()) { disclosed.record($0) }
-    let queue = JobQueue(env: env)
-    let session = try seedSession(root: root)
-
-    await queue.enqueue(session: session, remoteSilent: false)
-    _ = try await disclosed.waitForNote()
-
-    // Everything the Job persisted, read back as text.
-    let files = FileManager.default
-        .enumerator(at: root, includingPropertiesForKeys: nil)?
-        .compactMap { $0 as? URL }
-        .filter { !$0.hasDirectoryPath } ?? []
-    #expect(!files.isEmpty)
-    for file in files {
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-        #expect(!text.contains("embedding"),
-                "\(file.lastPathComponent) mentions an embedding")
-        #expect(!text.contains("speakerDatabase"),
-                "\(file.lastPathComponent) mentions a speaker database")
-    }
-    // The structural guarantee behind the above.
-    #expect(MemoryLayout<SpeakerSpan>.size == MemoryLayout<(String, Double, Double)>.size)
-}
+// MARK: - The pipeline
 
 /// ADR-0005's whole argument is that the 8GB constraint governs the recording
-/// window and local inference happens outside it. Measured peak for the models
-/// is ~450MB against R4's 100MB in-call budget, so this has to actually hold.
+/// window and inference happens outside it. Measured peak for the models is
+/// ~300MB against R4's 100MB in-call budget, so this has to actually hold.
 @Test func localWorkWaitsWhileASessionIsRecording() async throws {
     let root = tempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
 
-    let local = LocalAdapter(
-        engine: StubEngine(words: [TimedWord(text: "hello", start: 0, end: 1)]),
-        diarizer: StubDiarizer(spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 1)]))
     let disclosed = Disclosures()
-    let env = try makeLocalEnvironment(provider: local, fallback: nil, root: root,
-                                       summariser: StubSummary()) { disclosed.record($0) }
+    let env = try makeLocalEnvironment(root: root) { disclosed.record($0) }
     let queue = JobQueue(env: env)
     let session = try seedSession(root: root)
 
@@ -311,7 +191,7 @@ import FluidAudio
     try await Task.sleep(for: .milliseconds(300))
 
     var pending = await queue.pendingCount()
-    #expect(pending == 1, "a local Job must not start while a Session is recording")
+    #expect(pending == 1, "a Job must not start while a Session is recording")
 
     await queue.setRecordingActive(false)
     _ = try await disclosed.waitForNote()
@@ -319,26 +199,272 @@ import FluidAudio
     #expect(pending == 0, "and must run as soon as recording stops")
 }
 
-/// Cloud Jobs are just network, so they keep running during a call — holding
-/// them back would delay a Note for no benefit.
-@Test func cloudWorkIsNotHeldBackWhileRecording() async throws {
+/// R21: the raw material of diarization dies with its Job. Only a Voiceprint
+/// the user vouched for may persist, and there is no naming in this Session.
+@Test func noRawEmbeddingSurvivesACompletedJob() async throws {
     let root = tempRoot()
     defer { try? FileManager.default.removeItem(at: root) }
 
     let disclosed = Disclosures()
-    let env = try makeLocalEnvironment(provider: SimpleProvider(name: "assemblyai"),
-                                       fallback: nil, root: root,
-                                       summariser: StubSummary()) { disclosed.record($0) }
+    let env = try makeLocalEnvironment(
+        root: root,
+        diarizer: StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 1),
+                    SpeakerSpan(speakerId: "S1", start: 1.8, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: unitVector(seed: 7), seconds: 40),
+                     SpeakerVoice(speakerId: "S1", centroid: unitVector(seed: 9), seconds: 30)],
+            chunks: [VoiceChunk(speakerId: "S0", start: 0, end: 1,
+                                embedding: unitVector(seed: 7))])) { disclosed.record($0) }
     let queue = JobQueue(env: env)
     let session = try seedSession(root: root)
 
-    await queue.setRecordingActive(true)
     await queue.enqueue(session: session, remoteSilent: false)
-
     _ = try await disclosed.waitForNote()
+
+    // Everything the Job persisted, read back as text. The candidate centroids
+    // an unnamed Speaker leaves behind live in the encrypted naming record, so
+    // nothing readable on disk may mention them.
+    let files = FileManager.default
+        .enumerator(at: root, includingPropertiesForKeys: nil)?
+        .compactMap { $0 as? URL }
+        .filter { !$0.hasDirectoryPath } ?? []
+    #expect(!files.isEmpty)
+    for file in files {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+        #expect(!text.contains("centroid"), "\(file.lastPathComponent) mentions a centroid")
+        #expect(!text.contains("embedding"), "\(file.lastPathComponent) mentions an embedding")
+        #expect(!text.contains("voiceprint"), "\(file.lastPathComponent) mentions a voiceprint")
+    }
+    // The structural guarantee behind the above: a turn is a label and two
+    // timestamps, and the aligner can see nothing else.
+    #expect(MemoryLayout<SpeakerSpan>.size == MemoryLayout<(String, Double, Double)>.size)
+}
+
+/// R21: the naming record holds transcript text and candidate voiceprints, so
+/// it is sealed with the same key as the database.
+@Test func namingRecordsAreNotPlaintextOnDisk() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+    await queue.enqueue(session: session, remoteSilent: false)
+    _ = try await disclosed.waitForNote()
+
+    let stored = try FileManager.default.contentsOfDirectory(
+        at: root.appendingPathComponent("transcripts"), includingPropertiesForKeys: nil)
+    #expect(!stored.isEmpty, "the Session had a voice to name, so a record exists")
+    for file in stored {
+        let data = try Data(contentsOf: file)
+        let asText = String(data: data, encoding: .utf8) ?? ""
+        #expect(!asText.contains("their line"), "transcript text is readable on disk")
+        // And it round-trips through the store that owns the key.
+        #expect(env.transcripts.load(session.id) != nil)
+    }
+}
+
+// MARK: - Held Delivery (R26)
+
+@Test func heldDeliveryWaitsForNaming() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root, delivery: .held) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    try await disclosed.waitForHold()
+
+    let held = await queue.heldJobs()
+    #expect(held.count == 1)
+    #expect(disclosed.note == nil, "nothing may be written before the names arrive")
+    // R7/R26: the Recording is retained for the whole wait.
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    #expect(FileManager.default.fileExists(atPath: dir.path))
+    // And the record exists, undelivered, so the panel can show it.
+    let record = env.transcripts.load(session.id)
+    #expect(record?.isDelivered == false)
+}
+
+@Test func namingReleasesAHeldJob() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root, delivery: .held) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    try await disclosed.waitForHold()
+
+    let note = try await queue.applyNames(sessionID: session.id, names: ["Speaker 1": "Sarah"])
+    let written = try String(contentsOf: note, encoding: .utf8)
+    #expect(written.contains("engine:"))
+
+    let transcript = try String(
+        contentsOf: URL(fileURLWithPath: env.transcripts.load(session.id)!.transcriptPath),
+        encoding: .utf8)
+    #expect(transcript.contains("Sarah"))
+    #expect(!transcript.contains("Speaker 1"))
+
+    // The Job is finished and its Recording is gone (R7).
+    let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
+    #expect(!FileManager.default.fileExists(atPath: dir.path))
+    let stillHeld = await queue.heldJobs()
+    #expect(stillHeld.isEmpty)
+}
+
+/// R26: Held never waits when it has nothing to ask. A voice the database
+/// already knows is named without anyone being interrupted.
+@Test func heldDeliveryWithEverySpeakerMatchedDeliversImmediately() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let known = unitVector(seed: 3)
+    let box = SecretBox.ephemeral()
+    let voices = VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box)
+    await voices.enroll(SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60), as: "Sarah")
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(
+        root: root, delivery: .held, box: box, voices: voices,
+        diarizer: StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60)])
+    ) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    let note = try await disclosed.waitForNote()
+
+    let transcript = try String(
+        contentsOf: URL(fileURLWithPath: env.transcripts.load(session.id)!.transcriptPath),
+        encoding: .utf8)
+    #expect(transcript.contains("Sarah"), "a recognised voice is named without being asked")
+    #expect(!transcript.contains("Speaker 1"))
+    #expect(note.lastPathComponent.hasSuffix(".md"))
+}
+
+/// R25: skipping resolves Identification just as naming does — the clips go,
+/// and a Held Session delivers with the labels it has.
+@Test func skippingResolvesIdentificationAndDeletesClips() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root, delivery: .held) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    try await disclosed.waitForHold()
+
+    let note = try await queue.skipNaming(sessionID: session.id)
+    #expect(note != nil, "a Held Session still gets its Note")
+    #expect(env.clips.clips(for: session.id).isEmpty)
+    #expect(env.transcripts.load(session.id)?.namesApplied == true)
+    #expect(env.transcripts.load(session.id)?.candidates.isEmpty == true)
+}
+
+/// R24, the case that matters most: Braid named a returning voice by itself and
+/// got it wrong. Correcting it must remove the Voiceprint that produced the
+/// wrong match, not merely relabel the Note — otherwise the same mistake
+/// arrives again next week.
+@Test func correctingAnAutoNamedVoiceUnlearnsTheVoiceprintBehindIt() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let known = unitVector(seed: 3)
+    let box = SecretBox.ephemeral()
+    let voices = VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box)
+    await voices.enroll(SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60), as: "Sarah")
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(
+        root: root, box: box, voices: voices,
+        diarizer: StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60)])
+    ) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    _ = try await disclosed.waitForNote()
+
+    // Auto-named, and the record knows which Person it credited — keyed by the
+    // name the Transcript actually carries, which is what the naming flow sends.
+    let record = try #require(env.transcripts.load(session.id))
+    #expect(record.autoNamed["Sarah"] != nil)
+    #expect(record.candidates["Sarah"] != nil)
+    let before = await voices.database()
+    #expect(before.person(named: "Sarah")?.voiceprints.count == 2,
+            "being recognised contributes a fresh exemplar")
+
+    // It was actually Tom.
+    _ = try await queue.applyNames(sessionID: session.id, names: ["Sarah": "Tom"])
+
+    let after = await voices.database()
+    #expect(after.person(named: "Tom") != nil, "the right person was learned")
+    #expect((after.person(named: "Sarah")?.voiceprints.count ?? 0) < 2,
+            "the voiceprint that caused the wrong name is gone")
+    let transcript = try String(
+        contentsOf: URL(fileURLWithPath: after.persons.isEmpty ? "/dev/null"
+                        : env.transcripts.load(session.id)!.transcriptPath),
+        encoding: .utf8)
+    #expect(transcript.contains("Tom"))
+    #expect(!transcript.contains("Sarah"))
+}
+
+/// R28: the owner's voice bouncing back off the far end is folded into "Me",
+/// never dropped — those words were said.
+@Test func echoOfMeIsFoldedNotDeleted() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let mine = unitVector(seed: 11)
+    let box = SecretBox.ephemeral()
+    let voices = VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box)
+    await voices.enrollMe(SpeakerVoice(speakerId: "Me", centroid: mine, seconds: 90))
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(
+        root: root, box: box, voices: voices,
+        diarizer: StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: mine, seconds: 40)])
+    ) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    _ = try await disclosed.waitForNote()
+
+    let record = try #require(env.transcripts.load(session.id))
+    let text = record.transcript.markdown()
+    #expect(text.contains("Me (echo)"))
+    #expect(text.contains("their line"), "the words survive; only the label changes")
+    // Folded voices are resolved: nothing to ask, nothing to enroll.
+    #expect(record.candidates["Me (echo)"] == nil)
+    #expect(env.clips.clips(for: session.id).isEmpty)
 }
 
 // MARK: - Doubles
+
+func unitVector(seed: Int) -> [Float] {
+    // Deterministic, well-separated directions in a 256-dimensional space.
+    var v = [Float](repeating: 0, count: 256)
+    for i in v.indices {
+        v[i] = Float(sin(Double((i + 1) * seed) * 0.7)) + Float(seed % 3) * 0.01
+    }
+    return Vector.normalised(v)
+}
 
 final class StubEngine: TranscriberEngine, @unchecked Sendable {
     nonisolated let id: LocalEngine = .parakeet
@@ -370,27 +496,37 @@ final class StubEngine: TranscriberEngine, @unchecked Sendable {
     }
 }
 
-/// A cloud-shaped Provider: counts calls and always succeeds.
-final class SimpleProvider: STTProvider, @unchecked Sendable {
-    let name: String
+final class StubDiarizer: SpeakerDiarizing, @unchecked Sendable {
     private let lock = NSLock()
+    private let spans: [SpeakerSpan]
+    private let voices: [SpeakerVoice]
+    private let chunks: [VoiceChunk]
     private var _calls = 0
+    private var _received: Session.SpeakerExpectation?
     var callCount: Int { lock.withLock { _calls } }
+    var received: Session.SpeakerExpectation? { lock.withLock { _received } }
 
-    init(name: String) { self.name = name }
+    init(spans: [SpeakerSpan], voices: [SpeakerVoice] = [], chunks: [VoiceChunk] = []) {
+        self.spans = spans
+        self.voices = voices
+        self.chunks = chunks
+    }
 
-    func transcribe(track: URL, diarize: Bool, keyTerms: [String],
-                    expectedSpeakers: Session.SpeakerExpectation?) async throws -> [Utterance] {
-        lock.withLock { _calls += 1 }
-        return [Utterance(speaker: diarize ? "A" : "Me", start: 0, end: 1,
-                          text: diarize ? "their line" : "my line")]
+    func prepare(progress: (@Sendable (Double) -> Void)?) async throws {}
+
+    func diarize(file: URL, expected: Session.SpeakerExpectation?,
+                 wantsVoiceData: Bool) async throws -> DiarizationOutput {
+        lock.withLock { _calls += 1; _received = expected }
+        return DiarizationOutput(spans: spans,
+                                 voices: wantsVoiceData ? voices : [],
+                                 chunks: wantsVoiceData ? chunks : [])
     }
 }
 
 final class StubSummary: NoteSummarising, @unchecked Sendable {
     func summarise(transcript: Transcript, session: Session,
-                   preset: Preset) async throws -> Summariser.Output {
-        Summariser.Output(noteBody: "# Local note", inputTokens: 100, outputTokens: 50)
+                   preset: Preset) async throws -> SummaryOutput {
+        SummaryOutput(noteBody: "# Local note")
     }
 }
 
@@ -400,31 +536,48 @@ final class Disclosures: @unchecked Sendable {
     private let lock = NSLock()
     private var _note: URL?
     private var _failed = false
-    private var _fellBackTo: String?
-    var fellBackTo: String? { lock.withLock { _fellBackTo } }
+    private var _failure: String?
+    private var _held = false
+    var note: URL? { lock.withLock { _note } }
+    var held: Bool { lock.withLock { _held } }
+    var failure: String? { lock.withLock { _failure } }
 
     func record(_ event: JobQueue.Event) {
         lock.withLock {
             switch event {
             case .jobDone(_, let noteURL): _note = noteURL
-            case .jobFailed(_, let transient): if !transient { _failed = true }
-            case .providerFellBack(_, from: _, to: let to, reason: _): _fellBackTo = to
+            case .jobFailed(let job, let transient):
+                if !transient { _failed = true; _failure = job.lastError }
+            case .heldForNames: _held = true
             default: break
             }
         }
     }
 
     func waitForNote() async throws -> URL {
-        for _ in 0..<300 {
+        for _ in 0..<400 {
             if let note = lock.withLock({ _note }) { return note }
-            if lock.withLock({ _failed }) { throw TestFailure.jobFailed }
+            if lock.withLock({ _failed }) {
+                throw TestFailure.jobFailed(lock.withLock { _failure } ?? "?")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw TestFailure.timedOut
+    }
+
+    func waitForHold() async throws {
+        for _ in 0..<400 {
+            if lock.withLock({ _held }) { return }
+            if lock.withLock({ _failed }) {
+                throw TestFailure.jobFailed(lock.withLock { _failure } ?? "?")
+            }
             try await Task.sleep(for: .milliseconds(20))
         }
         throw TestFailure.timedOut
     }
 
     func waitForFailure() async throws {
-        for _ in 0..<300 {
+        for _ in 0..<400 {
             if lock.withLock({ _failed }) { return }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -432,34 +585,53 @@ final class Disclosures: @unchecked Sendable {
     }
 }
 
-enum TestFailure: Error { case timedOut, jobFailed }
+enum TestFailure: Error { case timedOut, jobFailed(String) }
 
-private func tempRoot() -> URL {
+func tempRoot() -> URL {
     FileManager.default.temporaryDirectory
         .appendingPathComponent("local-test-\(UUID().uuidString)")
 }
 
-private func makeLocalEnvironment(
-    provider: STTProvider, fallback: STTProvider?, root: URL,
+/// A pipeline wired entirely to doubles, with a throwaway encryption key so
+/// tests exercise real encryption without touching the developer's Keychain.
+func makeLocalEnvironment(
+    root: URL,
+    delivery: Delivery = .immediate,
+    box: SecretBox = .ephemeral(),
+    voices: VoiceStore? = nil,
+    engine: (any TranscriberEngine)? = nil,
+    diarizer: (any SpeakerDiarizing)? = nil,
     summariser: any NoteSummarising = StubSummary(),
     onEvent: @escaping @Sendable (JobQueue.Event) -> Void
 ) throws -> JobQueue.Environment {
     let defaults = UserDefaults(suiteName: "no.braid.test.\(UUID().uuidString)")!
     let settings = SettingsStore(defaults: defaults)
     settings.vaultPath = root.appendingPathComponent("vault").path
+    settings.delivery = delivery
+
+    let transcriber = Transcriber(
+        engine: engine ?? StubEngine(words: [
+            TimedWord(text: "their", start: 0.2, end: 0.6),
+            TimedWord(text: "line", start: 0.6, end: 1.0),
+        ]),
+        diarizer: diarizer ?? StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: unitVector(seed: 5), seconds: 40)]))
+
     return JobQueue.Environment(
-        provider: provider,
-        fallback: fallback,
+        transcriber: transcriber,
         summariser: summariser,
         settings: settings,
+        voices: voices ?? VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box),
+        clips: VoiceClipStore(root: root.appendingPathComponent("clips")),
         jobsRoot: root.appendingPathComponent("jobs"),
-        transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts")),
+        transcripts: TranscriptStore(root: root.appendingPathComponent("transcripts"), box: box),
         sessions: SessionIndex(url: root.appendingPathComponent("sessions.json")),
         onEvent: onEvent)
 }
 
-/// A Session with real CAF Tracks on disk, so the Job reaches the Provider.
-private func seedSession(root: URL, duration: TimeInterval = 60) throws -> Session {
+/// A Session with real CAF Tracks on disk, so the Job reaches the Engine.
+func seedSession(root: URL, duration: TimeInterval = 60) throws -> Session {
     let session = Session(title: "Local test", presetName: "Meeting", participants: [],
                           startedAt: Date(), recordedDuration: duration)
     let dir = root.appendingPathComponent("jobs").appendingPathComponent(session.id)
@@ -469,7 +641,7 @@ private func seedSession(root: URL, duration: TimeInterval = 60) throws -> Sessi
     return session
 }
 
-private func writeShortCAF(at url: URL, seconds: Double = 0.25) throws {
+func writeShortCAF(at url: URL, seconds: Double = 0.25) throws {
     let rate = 16_000.0
     let writer = try TrackWriter(url: url, deviceRate: rate)
     var samples = [Float](repeating: 0, count: Int(rate * seconds))
@@ -478,23 +650,4 @@ private func writeShortCAF(at url: URL, seconds: Double = 0.25) throws {
         writer.writeAsync(buffer.baseAddress!, frames: buffer.count)
     }
     writer.close()
-}
-
-final class StubDiarizer: SpeakerDiarizing, @unchecked Sendable {
-    private let lock = NSLock()
-    private let spans: [SpeakerSpan]
-    private var _calls = 0
-    private var _received: Session.SpeakerExpectation?
-    var callCount: Int { lock.withLock { _calls } }
-    var received: Session.SpeakerExpectation? { lock.withLock { _received } }
-
-    init(spans: [SpeakerSpan]) { self.spans = spans }
-
-    func prepare(progress: (@Sendable (Double) -> Void)?) async throws {}
-
-    func diarize(file: URL,
-                 expected: Session.SpeakerExpectation?) async throws -> [SpeakerSpan] {
-        lock.withLock { _calls += 1; _received = expected }
-        return spans
-    }
 }

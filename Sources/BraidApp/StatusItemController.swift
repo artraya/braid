@@ -116,11 +116,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let cost = NSMenuItem(
-            title: String(format: "Total cost $%.2f", state.settings.costTotalUSD),
+        let minutes = Int(state.usage.minutesUsed.rounded())
+        let usage = NSMenuItem(
+            title: "\(minutes) min recorded this month",
             action: nil, keyEquivalent: "")
-        cost.isEnabled = false
-        menu.addItem(cost)
+        usage.isEnabled = false
+        menu.addItem(usage)
 
         let history = NSMenuItem(title: "History", action: #selector(historyTapped),
                                  keyEquivalent: "")

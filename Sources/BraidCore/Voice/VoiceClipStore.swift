@@ -23,16 +23,20 @@ public struct VoiceClipStore: Sendable {
         self.root = root
     }
 
-    /// Cuts one clip per named Speaker from their longest overlap-free turn.
+    /// Cuts one clip per Speaker from their longest overlap-free turn.
     ///
     /// The longest turn, not the first: an opening "yeah, can you hear me"
     /// identifies nobody, while the stretch where someone actually made their
     /// point is unmistakable. Overlapping turns are skipped, since a clip with
     /// two people talking teaches the user nothing about which one they are
     /// naming.
+    ///
+    /// `speakers` maps the label the spans use (the diarizer's) to the label
+    /// the clip is filed under (the Transcript's), because the merge renumbers
+    /// voices between those two points.
     @discardableResult
     public func extract(from track: URL, spans: [SpeakerSpan],
-                        speakers: [String], sessionID: String) -> [String: URL] {
+                        speakers: [String: String], sessionID: String) -> [String: URL] {
         guard !speakers.isEmpty,
               let source = try? AVAudioFile(forReading: track) else { return [:] }
 
@@ -40,12 +44,12 @@ public struct VoiceClipStore: Sendable {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         var clips: [String: URL] = [:]
-        for speaker in speakers {
-            guard let span = bestTurn(for: speaker, in: spans) else { continue }
-            let destination = directory.appendingPathComponent("\(safe(speaker)).caf")
+        for (spanLabel, fileLabel) in speakers {
+            guard let span = bestTurn(for: spanLabel, in: spans) else { continue }
+            let destination = directory.appendingPathComponent("\(safe(fileLabel)).caf")
             do {
                 try cut(source, span: span, to: destination)
-                clips[speaker] = destination
+                clips[fileLabel] = destination
             } catch {
                 log.error("could not cut a voice clip: \(error.localizedDescription, privacy: .public)")
             }
@@ -69,20 +73,29 @@ public struct VoiceClipStore: Sendable {
 
     /// Copies the middle of the turn — speakers trail off at the end of one and
     /// are often clipped at the start.
+    ///
+    /// Every bound is checked against the file rather than trusted from the
+    /// span. Diarizer turns are derived from a resampled view of the audio and
+    /// can run a little past its actual end, and an unchecked frame count is a
+    /// trap rather than an error.
     private func cut(_ source: AVAudioFile, span: SpeakerSpan, to destination: URL) throws {
         let format = source.processingFormat
         let rate = format.sampleRate
+        guard rate > 0, source.length > 0 else { throw CocoaError(.fileReadUnknown) }
+
         let wanted = min(Self.maxSeconds, span.duration)
         let centre = span.start + span.duration / 2
         let start = max(0, centre - wanted / 2)
 
-        let startFrame = AVAudioFramePosition(start * rate)
-        let frames = AVAudioFrameCount(min(wanted * rate,
-                                           Double(source.length) - Double(startFrame)))
-        guard frames > 0, startFrame < source.length,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+        let startFrame = AVAudioFramePosition(max(0, min(start * rate, Double(source.length - 1))))
+        let available = Double(source.length - startFrame)
+        let frameCount = min(wanted * rate, available)
+        guard frameCount >= 1,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(frameCount)) else {
             throw CocoaError(.fileReadUnknown)
         }
+        let frames = AVAudioFrameCount(frameCount)
         source.framePosition = startFrame
         try source.read(into: buffer, frameCount: frames)
 

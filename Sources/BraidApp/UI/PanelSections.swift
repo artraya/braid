@@ -103,7 +103,7 @@ struct RecordingSection: View {
                 .font(.system(size: 36, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(Theme.text)
-            Text("\(state.currentTitle) · \(Format.money(model.costEstimate))")
+            Text(state.currentTitle)
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.faint)
                 .lineLimit(1)
@@ -163,26 +163,32 @@ struct RecordingSection: View {
                     in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
+    /// Stacked rather than in one row: at 228 points the three controls side by
+    /// side squeezed "Stop & save" onto three lines. Stopping gets the full
+    /// width it deserves as the action almost always wanted, and pause and
+    /// discard sit under it.
     private var controls: some View {
-        HStack(spacing: 12) {
-            CircleButton(symbol: paused ? "play.fill" : "pause.fill",
-                         tint: Theme.text,
-                         help: paused ? "Resume" : "Pause",
-                         action: actions.pauseResume)
+        VStack(spacing: 10) {
             Button(action: actions.stop) {
                 Text("Stop & save")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Theme.text)
-                    .padding(.vertical, 10)
-                    .padding(.horizontal, 20)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
                     .background(Theme.accent,
                                 in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             }
             .buttonStyle(.plain)
-            CircleButton(symbol: "xmark",
-                         tint: Theme.recording,
-                         help: "Discard this recording",
-                         action: actions.discardRecording)
+            HStack(spacing: 16) {
+                CircleButton(symbol: paused ? "play.fill" : "pause.fill",
+                             tint: Theme.text,
+                             help: paused ? "Resume" : "Pause",
+                             action: actions.pauseResume)
+                CircleButton(symbol: "xmark",
+                             tint: Theme.recording,
+                             help: "Discard this recording",
+                             action: actions.discardRecording)
+            }
         }
     }
 }
@@ -239,22 +245,20 @@ struct Waveform: View {
     }
 }
 
+/// This month, as a fact rather than a budget. There is nothing to cap: with
+/// the cloud gone, recording costs nothing but disk (R14 retired, R18 amended).
 struct UsageCard: View {
     let usage: Usage
-
-    private var barColour: Color {
-        usage.isOverCap ? Theme.recording : Theme.accent
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("USAGE")
+                Text("THIS MONTH")
                     .font(.system(size: 10, weight: .semibold))
                     .tracking(1.2)
                     .foregroundStyle(Theme.accent)
                 Spacer()
-                Text("\(Format.money(usage.costUSD)) · \(usage.daysLeftInMonth) day\(usage.daysLeftInMonth == 1 ? "" : "s") left")
+                Text("\(usage.sessionCount) session\(usage.sessionCount == 1 ? "" : "s")")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.dim)
             }
@@ -262,19 +266,10 @@ struct UsageCard: View {
                 Text("\(Int(usage.minutesUsed))")
                     .font(.system(size: 30, weight: .bold))
                     .foregroundStyle(Theme.text)
-                Text("of \(usage.minuteCap) min")
+                Text("minutes recorded")
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.dim)
             }
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.black.opacity(0.35))
-                    Capsule()
-                        .fill(barColour)
-                        .frame(width: max(4, geometry.size.width * usage.fraction))
-                }
-            }
-            .frame(height: 7)
         }
         .padding(14)
         .background(Theme.accentDim,
@@ -295,6 +290,9 @@ struct PendingAction: View {
             .buttonStyle(.plain)
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(tint)
+            // Without this a narrow row wraps the label one letter per line
+            // rather than letting the row be as wide as its buttons need.
+            .fixedSize()
     }
 }
 
@@ -306,27 +304,39 @@ struct PendingRow<Actions: View>: View {
     var symbol = "pause.circle"
     @ViewBuilder let actions: () -> Actions
 
+    /// Two rows, not one. Beside a title, two actions had barely thirty points
+    /// between them and "Process" came out stacked one letter per line; below
+    /// it they have the whole width and the title stops being truncated to
+    /// three characters.
     var body: some View {
-        HStack(spacing: 12) {
-            Group {
-                if spinning {
-                    ProgressView().controlSize(.small).scaleEffect(0.7)
-                } else {
-                    Image(systemName: symbol).font(.system(size: 14))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Group {
+                    if spinning {
+                        ProgressView().controlSize(.small).scaleEffect(0.7)
+                    } else {
+                        Image(systemName: symbol).font(.system(size: 13))
+                    }
                 }
-            }
-            .foregroundStyle(tint)
-            .frame(width: 24)
+                .foregroundStyle(tint)
+                .frame(width: 18)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .lineLimit(1)
-                Text(detail).font(.system(size: 11)).foregroundStyle(Theme.faint)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.faint)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 8)
-            HStack(spacing: 10) { actions() }
+            HStack(spacing: 14) {
+                Spacer(minLength: 0)
+                actions()
+            }
         }
         .padding(10)
         .background(Theme.cardRaised,
@@ -369,37 +379,89 @@ struct SessionRow: View {
     }
 }
 
+/// What the panel asks before a recording, which is now only one thing: who is
+/// on the call.
+///
+/// It asked three things and this is what became of them. The Preset moved to
+/// Settings, because the shape of a note is a standing preference rather than a
+/// per-call decision. The title left entirely — the Summariser names the Note
+/// from what was actually said (R9a), which beats a guess typed beforehand.
+/// Participants stayed, but as voices Braid already knows rather than as a
+/// comma-separated string: after a few sessions the people you record are
+/// mostly repeats, and ticking a name is quicker and spells it right.
 struct StartForm: View {
     let state: AppState
     let model: SessionsPanelModel
     let onStart: () -> Void
 
+    private var known: [Person] { state.knownPeople }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Picker("", selection: Binding(get: { model.presetName },
-                                          set: { model.presetName = $0 })) {
-                ForEach(state.settings.presets) { preset in
-                    Text(preset.name).tag(preset.name)
+        VStack(alignment: .leading, spacing: 10) {
+            if !known.isEmpty || !model.addedNames.isEmpty {
+                Text("WHO'S ON THIS CALL")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(1)
+                    .foregroundStyle(Theme.accent)
+                chips
+            }
+            addField
+            voiceCount
+        }
+        .padding(12)
+        .background(Theme.card,
+                    in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
+    }
+
+    /// One chip per known voice, plus anyone typed in. Wrapping is a real
+    /// layout rather than a fixed grid because names are all different lengths
+    /// and the panel is narrow enough that a two-column grid would leave "Sam"
+    /// sitting beside a lot of nothing.
+    private var chips: some View {
+        FlowLayout(spacing: 6) {
+            ForEach(known) { person in
+                let on = model.chosenPeople.contains(person.name)
+                NameChip(name: person.name, selected: on, removable: false) {
+                    if on { model.chosenPeople.remove(person.name) }
+                    else { model.chosenPeople.insert(person.name) }
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
+            ForEach(model.addedNames, id: \.self) { name in
+                NameChip(name: name, selected: true, removable: true) {
+                    model.addedNames.removeAll { $0 == name }
+                }
+            }
+        }
+    }
 
-            TextField("Title (optional)", text: Binding(get: { model.title },
-                                                        set: { model.title = $0 }))
+    private var addField: some View {
+        HStack(spacing: 6) {
+            TextField(known.isEmpty ? "Who's on this call?" : "Someone else…",
+                      text: Binding(get: { model.typedName },
+                                    set: { model.typedName = $0 }))
                 .textFieldStyle(.roundedBorder)
-                .onSubmit(onStart)
-            TextField("Participants, comma separated (optional)",
-                      text: Binding(get: { model.participants },
-                                    set: { model.participants = $0 }))
-                .textFieldStyle(.roundedBorder)
-                .onSubmit(onStart)
+                .font(.system(size: 11))
+                .onSubmit { model.commitTypedName(known: known) }
+            if !model.typedName.trimmingCharacters(in: .whitespaces).isEmpty {
+                Button {
+                    model.commitTypedName(known: known)
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Theme.accent)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
 
-            HStack(spacing: 8) {
-                Text("Voices on the far end")
+    /// Centred, as the one control that is genuinely optional here.
+    private var voiceCount: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                Text("Voices")
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.dim)
-                Spacer(minLength: 0)
                 Picker("", selection: Binding(get: { model.speakerCount },
                                               set: { model.selectSpeakerCount($0) })) {
                     Text("Auto").tag(Int?.none)
@@ -409,34 +471,123 @@ struct StartForm: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(width: 74)
-                if model.speakerCount != nil {
-                    Toggle("exactly", isOn: Binding(get: { model.speakersStrict },
-                                                    set: { model.speakersStrict = $0 }))
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.dim)
-                        .help("Also cap the count. Anyone who joins late is merged into these voices.")
-                }
+                .frame(width: 72)
             }
-
-            Text(footer)
-                .font(.system(size: 10))
-                .foregroundStyle(Theme.faint)
-                .fixedSize(horizontal: false, vertical: true)
+            // Its own row: beside the picker there were about twenty points
+            // left and the label came out as "exactl / y".
+            if model.speakerCount != nil {
+                Toggle("exactly this many", isOn: Binding(get: { model.speakersStrict },
+                                                          set: { model.speakersStrict = $0 }))
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                    .fixedSize()
+                    .help("Also cap the count. Anyone who joins late is merged into these voices.")
+            }
+            if let footer {
+                Text(footer)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.faint)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(12)
-        .background(Theme.card,
-                    in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
+        .frame(maxWidth: .infinity)
     }
 
-    /// The line under the form owns whatever risk the current choice carries.
-    private var footer: String {
-        guard let count = model.speakerCount else {
-            return "One name and one voice names itself. Anyone who joins is still picked up."
-        }
+    /// Only speaks up when the choice carries a risk. Auto is the safe default
+    /// and does not need explaining every time the panel opens.
+    private var footer: String? {
+        guard let count = model.speakerCount else { return nil }
         return model.speakersStrict
-            ? "Exactly \(count): late joiners will be merged into these voices. Untick for at-least, or use Auto."
-            : "At least \(count): helps split similar voices. Anyone who joins is still picked up."
+            ? "Exactly \(count) — late joiners get merged in."
+            : "At least \(count) — helps split similar voices."
+    }
+}
+
+/// A name you can tick. Selected names are the ones the Session expects.
+struct NameChip: View {
+    let name: String
+    let selected: Bool
+    let removable: Bool
+    let tap: () -> Void
+
+    var body: some View {
+        Button(action: tap) {
+            HStack(spacing: 4) {
+                Text(name)
+                    .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                    .lineLimit(1)
+                if removable {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .opacity(0.7)
+                }
+            }
+            .foregroundStyle(selected ? Theme.text : Theme.dim)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(selected ? Theme.accent : Theme.cardRaised,
+                        in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(removable ? "Remove \(name)" : (selected ? "Expecting \(name)" : "Add \(name)"))
+    }
+}
+
+/// Left-aligned wrapping, the way tags wrap everywhere else. SwiftUI has no
+/// built-in for it, and the alternatives — a fixed grid, or a horizontal
+/// scroller — either waste the width or hide names off the edge, both of which
+/// matter more at 228 points than they would in a window.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews,
+                      cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let rows = arrange(subviews: subviews, width: width)
+        let height = rows.reduce(0) { $0 + $1.height } +
+            spacing * CGFloat(max(0, rows.count - 1))
+        return CGSize(width: proposal.width ?? rows.map(\.width).max() ?? 0,
+                      height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(subviews: subviews, width: bounds.width) {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row {
+        var indices: [Int] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func arrange(subviews: Subviews, width: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let needed = row.indices.isEmpty ? size.width : row.width + spacing + size.width
+            if !row.indices.isEmpty, needed > width {
+                rows.append(row)
+                row = Row()
+            }
+            row.width = row.indices.isEmpty ? size.width : row.width + spacing + size.width
+            row.height = max(row.height, size.height)
+            row.indices.append(index)
+        }
+        if !row.indices.isEmpty { rows.append(row) }
+        return rows
     }
 }

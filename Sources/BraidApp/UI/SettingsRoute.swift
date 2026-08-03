@@ -1,24 +1,33 @@
 import SwiftUI
+import AppKit
 import Observation
 import BraidCore
 
 /// The settings form's own state, loaded from the store when the view opens and
-/// written back on Save. Nothing is applied as you type: half-typed API keys and
-/// preset prompts should not take effect.
+/// written back on Save. Nothing is applied as you type: a half-typed preset
+/// prompt should not take effect.
 @MainActor
 @Observable
 final class SettingsFormModel {
     var vaultPath = ""
-    var assemblyKey = ""
-    var anthropicKey = ""
     var keyTerms = ""
-    var minuteCap = ""
     var autoEndEnabled = true
     var callApps = ""
     var presets: [Preset] = []
+    /// Which Preset every Session uses. Chosen here rather than at Start.
+    var defaultPreset = ""
+    /// Which Preset's prompt the editor is showing, which is usually but not
+    /// always the default one.
     var editingPreset = ""
-    var providerMode: ProviderMode = .cloud
-    var localEngine: LocalEngine = .parakeet
+    var localEngine: LocalEngine = .apple
+    var holdForNames = false
+    var summaryEngine: SummaryEngine = .appleBuiltIn
+    /// Which groups are open. Held here rather than in `@State` so the views
+    /// stay pure functions of a model (ADR-0004), and so reopening Settings
+    /// does not fold everything up again mid-task.
+    var expanded: Set<String> = []
+    /// Only the prompt editor, which is long, ugly and rarely wanted.
+    var showingPrompt = false
 
     var editingPromptIndex: Int? {
         presets.firstIndex { $0.name == editingPreset }
@@ -27,47 +36,36 @@ final class SettingsFormModel {
     func load(from state: AppState) {
         let settings = state.settings
         vaultPath = settings.vaultPath ?? ""
-        // Keys are never read back out of the Keychain to fill these in: doing
-        // so would put secrets on screen and prompt for Keychain consent every
-        // time settings opened. Blank means "leave whatever is stored".
-        assemblyKey = ""
-        anthropicKey = ""
         keyTerms = settings.keyTerms.joined(separator: "\n")
-        minuteCap = "\(settings.monthlyMinuteCap)"
         autoEndEnabled = settings.autoEndEnabled
         callApps = settings.callAppBundleIDs.joined(separator: "\n")
         presets = settings.presets
-        editingPreset = presets.first?.name ?? ""
-        providerMode = settings.providerMode
+        defaultPreset = settings.defaultPresetName
+        editingPreset = defaultPreset
         localEngine = settings.localEngine
+        holdForNames = settings.delivery == .held
+        summaryEngine = settings.summaryEngine
     }
 
     func save(to state: AppState) {
         let settings = state.settings
         let path = vaultPath.trimmingCharacters(in: .whitespaces)
         settings.vaultPath = path.isEmpty ? nil : path
-        if !assemblyKey.isEmpty {
-            try? settings.keychain.set(assemblyKey, for: .assemblyAI)
-        }
-        if !anthropicKey.isEmpty {
-            try? settings.keychain.set(anthropicKey, for: .anthropic)
-        }
         settings.keyTerms = lines(keyTerms)
-        if let cap = Int(minuteCap.trimmingCharacters(in: .whitespaces)), cap > 0 {
-            settings.monthlyMinuteCap = cap
-        }
         settings.autoEndEnabled = autoEndEnabled
         let apps = lines(callApps)
         if !apps.isEmpty { settings.callAppBundleIDs = apps }
         settings.presets = presets
-        let providerChanged = settings.providerMode != providerMode
-            || settings.localEngine != localEngine
-        settings.providerMode = providerMode
+        settings.defaultPresetName = defaultPreset
+        settings.delivery = holdForNames ? .held : .immediate
+        let engineChanged = settings.localEngine != localEngine
+            || settings.summaryEngine != summaryEngine
         settings.localEngine = localEngine
-        if providerChanged {
-            state.applyProviderSettings()
+        settings.summaryEngine = summaryEngine
+        if engineChanged {
+            state.applyEngineSettings()
             // Fetch the models now rather than making the next Session wait.
-            if providerMode != .cloud { state.prepareLocalModels() }
+            state.prepareLocalModels()
         }
     }
 
@@ -94,26 +92,25 @@ struct SettingsRoute: View {
                     .foregroundStyle(Theme.faint)
             }
 
+            // One visible setting and five drawers. Everything below Vault is
+            // something you set once, so showing it all at once made a wall of
+            // controls that had to be read to be navigated.
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // This month at a glance, moved off the main view
-                    // (amended R18); cap warnings still notify on their own.
-                    UsageCard(usage: state.usage)
+                VStack(alignment: .leading, spacing: 10) {
                     vault
-                    transcription
-                    keys
-                    keyTerms
-                    budget
-                    autoEnd
-                    presets
-                    Text("Total spent so far: \(Format.money(state.settings.costTotalUSD))")
+                    SettingsGroup(title: "Notes", icon: "doc.text", form: form) { notes }
+                    SettingsGroup(title: "Voices", icon: "person.wave.2", form: form) { people }
+                    SettingsGroup(title: "Models", icon: "cpu", form: form) { models }
+                    SettingsGroup(title: "Recording", icon: "record.circle", form: form) { recording }
+                    Text("Everything happens on this Mac.")
                         .font(.system(size: 10))
                         .foregroundStyle(Theme.faint)
+                        .padding(.top, 2)
                 }
                 .padding(.trailing, 2)
             }
             .scrollIndicators(.automatic)
-            .frame(maxHeight: 380)
+            .frame(maxHeight: 400)
 
             Button(action: actions.saveSettings) {
                 Text("Save")
@@ -127,10 +124,13 @@ struct SettingsRoute: View {
             .buttonStyle(.plain)
         }
         .padding(Theme.padding)
+        .onAppear { state.refreshPeople() }
     }
 
+    /// The one thing Braid cannot work out for itself, so the one thing that
+    /// is never behind a drawer.
     private var vault: some View {
-        Field("Vault folder", note: "Notes here, transcripts in transcripts/") {
+        Field("Vault folder") {
             HStack(spacing: 6) {
                 TextField("", text: binding(\.vaultPath))
                     .textFieldStyle(.roundedBorder)
@@ -143,119 +143,184 @@ struct SettingsRoute: View {
         }
     }
 
-    private var transcription: some View {
-        Field("Transcription", note: transcriptionNote) {
-            VStack(alignment: .leading, spacing: 6) {
-                Picker("", selection: binding(\.providerMode)) {
-                    ForEach(ProviderMode.allCases, id: \.self) { mode in
-                        Text(mode.label).tag(mode)
+    /// What a Note looks like and when it lands. The Preset moved here from the
+    /// Start form: it is a standing preference, not a per-call decision.
+    private var notes: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Field("Shape") {
+                Picker("", selection: binding(\.defaultPreset)) {
+                    ForEach(form.presets) { preset in
+                        Text(preset.name).tag(preset.name)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .font(.system(size: 11))
+                .onChange(of: form.defaultPreset) { _, new in form.editingPreset = new }
+            }
+
+            Toggle("Wait for speaker names", isOn: binding(\.holdForNames))
+                .toggleStyle(.checkbox)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.text)
+                .help("Hold the note back until you have named the voices Braid does not recognise. It never waits when it recognises everyone.")
+
+            Disclosure(title: "Edit the prompt",
+                       open: Binding(get: { form.showingPrompt },
+                                     set: { form.showingPrompt = $0 })) {
+                if let index = form.editingPromptIndex {
+                    MultilineField(
+                        text: Binding(get: { form.presets[index].prompt },
+                                      set: { form.presets[index].prompt = $0 }),
+                        height: 140)
+                }
+            }
+        }
+    }
+
+    /// R29: the Voice Database is the user's to manage. Deliberately plain —
+    /// every person, how much Braid has heard of them, and a way to remove any
+    /// of it.
+    private var people: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if state.knownPeople.isEmpty {
+                Text("Nobody yet. Name a speaker once and Braid recognises them next time.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(state.knownPeople) { person in
+                    HStack(spacing: 6) {
+                        Text(person.name)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Theme.text)
+                            .lineLimit(1)
+                        Text("\(person.voiceprints.count)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.faint)
+                            .help("\(person.voiceprints.count) voice sample\(person.voiceprints.count == 1 ? "" : "s")")
+                        Spacer(minLength: 4)
+                        Button("Forget") { state.forgetPerson(id: person.id) }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.faint)
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                Button("Export…", action: exportVoices)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                Button("Import…", action: importVoices)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                Spacer(minLength: 4)
+                if !state.knownPeople.isEmpty {
+                    Button("Forget all", action: confirmForgetEveryone)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.recording)
+                }
+            }
+        }
+    }
+
+    /// Who transcribes and who writes. Both choices are trade-offs rather than
+    /// better-and-worse, so each keeps one line saying what it costs.
+    private var models: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Field("Transcription", note: form.localEngine == .apple
+                  ? "Takes key terms. Nothing to download."
+                  : "Better on words. No key terms, 443MB.") {
+                Picker("", selection: binding(\.localEngine)) {
+                    ForEach(LocalEngine.allCases, id: \.self) { engine in
+                        Text(engine.label).tag(engine)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .font(.system(size: 11))
+            }
 
-                if form.providerMode != .cloud {
-                    Picker("", selection: binding(\.localEngine)) {
-                        ForEach(LocalEngine.allCases, id: \.self) { engine in
-                            Text(engine.label).tag(engine)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .font(.system(size: 11))
-
-                    if let error = state.localModelError {
-                        Text(error)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
-                            .lineLimit(3)
+            Field("Summaries", note: form.summaryEngine == .appleBuiltIn
+                  ? "Free and instant, but refuses some subjects."
+                  : "Refuses nothing, reads a whole meeting at once. 2.3GB.") {
+                Picker("", selection: binding(\.summaryEngine)) {
+                    ForEach(SummaryEngine.allCases, id: \.self) { engine in
+                        Text(engine.label).tag(engine)
                     }
                 }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .font(.system(size: 11))
+            }
+
+            if let progress = state.modelDownload {
+                Text(progress)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.accent)
+            }
+            ForEach([state.localModelError, state.summariserProblem].compactMap { $0 },
+                    id: \.self) { problem in
+                Text(problem)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Field("Key terms", note: "Names and jargon, one per line.") {
+                MultilineField(text: binding(\.keyTerms), height: 60)
             }
         }
     }
 
-    private var transcriptionNote: String {
-        switch form.providerMode {
-        case .cloud:
-            "AssemblyAI. About $0.54 an hour, and the audio leaves this Mac."
-        case .local:
-            "On this Mac only. Free, nothing uploaded, and a failure waits for you rather than falling back."
-        case .auto:
-            "On this Mac, falling back to AssemblyAI if that fails. The note always says which ran."
-        }
-    }
-
-    private var keys: some View {
-        Field("API keys", note: state.keysConfigured
-              ? "Stored in the Keychain. Leave blank to keep them."
-              : "Needed before recording. Stored in the Keychain.") {
-            VStack(spacing: 6) {
-                SecureField("AssemblyAI key", text: binding(\.assemblyKey))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11))
-                SecureField("Anthropic key", text: binding(\.anthropicKey))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11))
-            }
-        }
-    }
-
-    private var keyTerms: some View {
-        Field("Key terms",
-              note: "Names and jargon the transcriber would not guess, one per line. Keep it tight; padding it makes accuracy worse.") {
-            MultilineField(text: binding(\.keyTerms), height: 64)
-        }
-    }
-
-    private var budget: some View {
-        Field("Monthly budget",
-              note: "Minutes per calendar month. Warns as you approach it, never blocks recording.") {
-            HStack(spacing: 6) {
-                TextField("600", text: binding(\.minuteCap))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11))
-                    .frame(width: 80)
-                Text("minutes").font(.system(size: 11)).foregroundStyle(Theme.faint)
-            }
-        }
-    }
-
-    private var autoEnd: some View {
-        Field("Stop automatically",
-              note: "When a call app releases the microphone. Bundle IDs, one per line, matched as prefixes.") {
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle("Stop 30s after the call ends", isOn: binding(\.autoEndEnabled))
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.text)
-                MultilineField(text: binding(\.callApps), height: 58)
+    private var recording: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Stop 30s after the call ends", isOn: binding(\.autoEndEnabled))
+                .toggleStyle(.checkbox)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.text)
+            Field("Call apps", note: "Bundle IDs, one per line.") {
+                MultilineField(text: binding(\.callApps), height: 56)
                     .opacity(form.autoEndEnabled ? 1 : 0.4)
                     .disabled(!form.autoEndEnabled)
             }
         }
     }
 
-    private var presets: some View {
-        Field("Presets", note: "The prompt that shapes each kind of note.") {
-            VStack(alignment: .leading, spacing: 6) {
-                Picker("", selection: binding(\.editingPreset)) {
-                    ForEach(form.presets) { preset in
-                        Text(preset.name).tag(preset.name)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
+    // MARK: - Voice database actions
 
-                if let index = form.editingPromptIndex {
-                    MultilineField(
-                        text: Binding(get: { form.presets[index].prompt },
-                                      set: { form.presets[index].prompt = $0 }),
-                        height: 130)
-                }
-            }
-        }
+    private func exportVoices() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "braid-voices.json"
+        panel.message = "This file is readable. It contains voice data for everyone Braid knows."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.exportVoices(to: url)
+    }
+
+    private func importVoices() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Replaces everyone Braid currently knows."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        state.importVoices(from: url)
+    }
+
+    private func confirmForgetEveryone() {
+        let alert = NSAlert()
+        alert.messageText = "Forget every voice?"
+        alert.informativeText = """
+            Braid will stop recognising everyone and will not be able to read \
+            what it has stored. Notes you already have keep their names.
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Forget everyone")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        state.forgetEveryone()
     }
 
     private func binding<Value>(_ keyPath: ReferenceWritableKeyPath<SettingsFormModel, Value>)
@@ -264,29 +329,106 @@ struct SettingsRoute: View {
     }
 }
 
-/// A labelled block: caption, explanation, then the control.
+/// A labelled block: caption, an optional line of explanation, then the control.
+///
+/// The note is optional now and most callers skip it. Settings had a paragraph
+/// under every control, which is fine to read once and noise every time after
+/// — anything that was worth keeping moved into a `.help` tooltip, and anything
+/// that was not is gone.
 private struct Field<Content: View>: View {
     let label: String
-    let note: String
+    let note: String?
     @ViewBuilder let content: () -> Content
 
-    init(_ label: String, note: String, @ViewBuilder content: @escaping () -> Content) {
+    init(_ label: String, note: String? = nil,
+         @ViewBuilder content: @escaping () -> Content) {
         self.label = label
         self.note = note
         self.content = content
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(label.uppercased())
                 .font(.system(size: 9, weight: .semibold))
                 .tracking(1)
                 .foregroundStyle(Theme.accent)
-            Text(note)
-                .font(.system(size: 10))
-                .foregroundStyle(Theme.faint)
-                .fixedSize(horizontal: false, vertical: true)
             content()
+            if let note {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// A named drawer. Closed, it is one row; open, it holds a section of Settings.
+///
+/// Expansion lives on the form model rather than in `@State`, keyed by title,
+/// which keeps the view a pure function of its model and means the drawer you
+/// were working in is still open when you come back from a file picker.
+private struct SettingsGroup<Content: View>: View {
+    let title: String
+    let icon: String
+    let form: SettingsFormModel
+    @ViewBuilder let content: () -> Content
+
+    private var isOpen: Bool { form.expanded.contains(title) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                if isOpen { form.expanded.remove(title) } else { form.expanded.insert(title) }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 14)
+                    Text(title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.faint)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isOpen { content() }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card,
+                    in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
+    }
+}
+
+/// The same idea one level down, for a single long control inside a group.
+private struct Disclosure<Content: View>: View {
+    let title: String
+    let open: Binding<Bool>
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { open.wrappedValue.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .rotationEffect(.degrees(open.wrappedValue ? 90 : 0))
+                    Text(title).font(.system(size: 10, weight: .semibold))
+                }
+                .foregroundStyle(Theme.faint)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if open.wrappedValue { content() }
         }
     }
 }

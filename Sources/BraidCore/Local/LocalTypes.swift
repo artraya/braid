@@ -51,6 +51,25 @@ public enum Delivery: String, Sendable, Codable, CaseIterable {
     }
 }
 
+/// Which model writes the Note.
+///
+/// Two, because they fail differently. Apple's is free, weightless and always
+/// there, and refuses whole subjects — a recorded discussion of a news story
+/// was declined outright, and no setting reaches that decision (ADR-0006). An
+/// open-weights model has no such training but costs a couple of gigabytes of
+/// download and of memory while it runs.
+public enum SummaryEngine: String, Sendable, Codable, CaseIterable {
+    case appleBuiltIn
+    case openWeights
+
+    public var label: String {
+        switch self {
+        case .appleBuiltIn: "Apple's"
+        case .openWeights: "Open model"
+        }
+    }
+}
+
 /// One speaker's turn, as the diarizer heard it.
 ///
 /// Carries a label and two timestamps and nothing else. The voice data the

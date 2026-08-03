@@ -1,17 +1,35 @@
 #!/bin/bash
-# Assembles and signs dist/Braid.app from a release build (ADR-0004:
-# SwiftPM + CLT, no Xcode). This is the deploy artifact for /Applications.
+# Assembles and signs dist/Braid.app. This is the deploy artifact for
+# /Applications.
+#
+# Built with xcodebuild rather than `swift build`, which mlx-swift's own README
+# is explicit about: SwiftPM on the command line cannot compile Metal shaders,
+# so a `swift build` produces a binary that dies at the first MLX call with
+# "Failed to load the default metallib". ADR-0004 records why Xcode is now a
+# prerequisite. The unit tests still run under plain SwiftPM (scripts/test.sh),
+# because the test target does not depend on BraidMLX.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-swift build -c release
-BIN="$(swift build -c release --show-bin-path)/BraidApp"
+DERIVED=.build/xcode
+xcodebuild build -scheme braid -destination 'platform=OS X' \
+  -configuration Release -derivedDataPath "$DERIVED" \
+  CODE_SIGNING_ALLOWED=NO >/dev/null
+PRODUCTS="$DERIVED/Build/Products/Release"
+BIN="$PRODUCTS/BraidApp"
+[ -x "$BIN" ] || { echo "no binary at $BIN"; exit 1; }
 
 APP=dist/Braid.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/Braid"
+# SwiftPM resource bundles have to travel with the binary. mlx-swift_Cmlx holds
+# default.metallib — every Metal kernel MLX runs — and its absence is not a
+# build error, only a crash on the first summary.
+for bundle in "$PRODUCTS"/*.bundle; do
+  [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
+done
 [ -f Resources/AppIcon.icns ] || ./scripts/make-icon.sh
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
@@ -27,7 +45,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
-    <key>LSMinimumSystemVersion</key><string>27.0</string>
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>

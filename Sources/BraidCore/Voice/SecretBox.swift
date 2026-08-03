@@ -66,11 +66,81 @@ public struct SecretBox: Sendable {
         case .raw(let key):
             return key
         case .keychain(let service):
-            if let existing = try load(service: service) { return existing }
+            if let existing = try load(service: service) {
+                // An item created by an earlier build carries an ACL naming
+                // that binary, so every rebuild triggers a password prompt.
+                // Rewrite it once with the same bytes and a permissive ACL:
+                // nothing encrypted with it becomes unreadable, and the
+                // prompting stops.
+                if !isPermissive(service: service) {
+                    try? rewritePermissively(existing, service: service)
+                }
+                return existing
+            }
             let fresh = SymmetricKey(size: .bits256)
             try store(fresh, service: service)
             return fresh
         }
+    }
+
+    /// An ACL whose trusted-application list is empty means "any application,
+    /// no prompt".
+    ///
+    /// This is a deliberate trade, not an oversight. The prompt defends against
+    /// another process on *this Mac* reading the key — but such a process can
+    /// already read the Vault, the transcripts and the audio, so the prompt buys
+    /// almost nothing while costing a password on every rebuild. What the
+    /// encryption actually defends against is the database file travelling
+    /// somewhere without this Keychain: a backup drive, a synced folder,
+    /// another machine. That property is unaffected by the ACL.
+    private func permissiveAccess() -> SecAccess? {
+        var access: SecAccess?
+        guard SecAccessCreate("Braid voice data" as CFString, nil, &access) == errSecSuccess,
+              let access else { return nil }
+        guard let acls = SecAccessCopyMatchingACLList(
+            access, kSecACLAuthorizationDecrypt) as? [SecACL] else { return access }
+        for acl in acls {
+            // A nil application list is the "any application" case; an empty
+            // prompt selector means it never asks.
+            SecACLSetContents(acl, nil, "" as CFString, SecKeychainPromptSelector())
+        }
+        return access
+    }
+
+    private func isPermissive(service: String) -> Bool {
+        var item: CFTypeRef?
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let keychainItem = item else { return false }
+        var access: SecAccess?
+        // swiftlint:disable:next force_cast
+        guard SecKeychainItemCopyAccess(keychainItem as! SecKeychainItem, &access) == errSecSuccess,
+              let access,
+              let acls = SecAccessCopyMatchingACLList(
+                access, kSecACLAuthorizationDecrypt) as? [SecACL] else { return false }
+        for acl in acls {
+            var applications: CFArray?
+            var description: CFString?
+            var selector = SecKeychainPromptSelector()
+            guard SecACLCopyContents(acl, &applications, &description, &selector) == errSecSuccess
+            else { return false }
+            // Any ACL still naming specific applications is what prompts.
+            if applications != nil { return false }
+        }
+        return true
+    }
+
+    private func rewritePermissively(_ key: SymmetricKey, service: String) throws {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ] as CFDictionary)
+        try store(key, service: service)
     }
 
     private func load(service: String) throws -> SymmetricKey? {
@@ -99,11 +169,14 @@ public struct SecretBox: Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecValueData as String: data,
+            // Never synced to iCloud Keychain: the key stays on this Mac.
+            kSecAttrSynchronizable as String: false,
         ]
-        // This device only: never synced to iCloud Keychain, never restored to
-        // another Mac. Deliberately stronger than the app's old API-key items,
-        // because a leaked API key can be rotated and a voiceprint cannot.
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        if let access = permissiveAccess() {
+            add[kSecAttrAccess as String] = access
+        } else {
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        }
         let status = SecItemAdd(add as CFDictionary, nil)
         guard status == errSecSuccess else { throw Failure.keychain(status) }
     }

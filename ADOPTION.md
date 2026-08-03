@@ -428,4 +428,26 @@ boundary now means you will notice when you cross it.
 
 ## Reassessment history
 
-None. This is the first adoption baseline.
+### 2026-08-02 — the public-use decision is reversed
+
+The owner's decision of 2026-08-01, recorded throughout this document, was that
+Braid is "being developed for public use", superseding SPEC non-goal #6. **That
+is no longer true.** Braid is a private, single-owner project again: the source
+comes off GitHub, there is no distribution and no support, and non-goal #6's
+original substance is restored as non-goal 7 in the current SPEC.
+
+The reason is that the reversal buys something. A private app may reasonably
+remember the voices its owner has personally named
+([ADR-0007](docs/adr/0007-the-voice-database.md), superseding ADR-0003's "no
+voiceprints, ever"), and that is only honest if nothing derived from a voice can
+leave the machine — so the cloud services went too
+([ADR-0006](docs/adr/0006-zero-cloud.md)).
+
+Everything in this document that reasons from public use should be read as
+historical: the lane recommendation still holds, but it now holds for the plainer
+reason that this is one person's tool on one Mac. Open question 1 above ("what
+does public use concretely include?") is closed as moot. Open question 3 is
+closed the other way: nothing is being published.
+
+What this baseline still records accurately: the codebase map, the evidence
+inventory, the document audit, and the fast-lane routing.
