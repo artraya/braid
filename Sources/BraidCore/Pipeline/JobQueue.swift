@@ -402,11 +402,23 @@ public actor JobQueue {
         // in the diarizer's labels and the naming flow works in Transcript
         // labels, so the clips are cut under the former and filed under the
         // latter.
-        if !identified.unnamed.isEmpty {
+        //
+        // Auto-named voices get a clip too, which they did not used to. A name
+        // the user was asked about is one they can check by reading the Note; a
+        // name Braid applied on its own confidence is the only kind that can be
+        // wrong without anybody being asked. That is exactly the case worth
+        // being able to listen back to, and the whole reason Re-naming exists.
+        let needsClip = Set(identified.unnamed).union(identified.autoNamed.keys)
+        if !needsClip.isEmpty {
             var wanted: [String: String] = [:]
-            for (diarizerLabel, mergedLabel) in merged.remoteLabels
-            where identified.unnamed.contains(mergedLabel) {
-                wanted[diarizerLabel] = mergedLabel
+            for (diarizerLabel, mergedLabel) in merged.remoteLabels {
+                // Both sets are keyed by the label the Transcript ended up with,
+                // so the merge label has to be carried across the rename before
+                // it can be matched — otherwise an auto-named voice is looked up
+                // as "Speaker 1" and never gets a clip.
+                let final = identified.finalLabels[mergedLabel] ?? mergedLabel
+                guard needsClip.contains(final) else { continue }
+                wanted[diarizerLabel] = final
             }
             env.clips.extract(from: remoteCAF, spans: remote.spans,
                               speakers: wanted, sessionID: job.id)
@@ -462,9 +474,11 @@ public actor JobQueue {
             env.transcripts.save(record)
             if !identified.unnamed.isEmpty {
                 env.onEvent(.speakersDetected(job, stats, mismatch))
-            } else {
-                env.clips.delete(sessionID: job.id)
             }
+            // Clips are no longer dropped the moment Identification resolves.
+            // They age out with the naming record instead (R25 as amended), so
+            // a name that turns out to be wrong can still be checked against
+            // the voice weeks later. They are a few hundred KB per Session.
         }
 
         // Only a confirmed-success Job may delete a Recording (Operation).
@@ -482,6 +496,10 @@ public actor JobQueue {
         var suggestions: [String: String]
         /// Speaker label → Person id, for names applied without asking.
         var autoNamed: [String: String]
+        /// Pre-rename label → the label the Transcript ended up with. Everything
+        /// downstream of `identify` works in the latter — including the Voice
+        /// Clips, which are filed under the name the naming view will show.
+        var finalLabels: [String: String]
     }
 
     /// Folds echo, applies confident matches, and leaves everything else for
@@ -535,6 +553,7 @@ public actor JobQueue {
             log.notice("named the single voice from the single declared participant")
         }
 
+        let before = transcript.remoteSpeakers
         transcript = transcript.renamingSpeakers(names)
         let unnamed = transcript.remoteSpeakers.filter { $0.hasPrefix("Speaker ") }
 
@@ -557,13 +576,17 @@ public actor JobQueue {
             keyedSuggestions[finalLabel(label)] = name
         }
 
+        var finalLabels: [String: String] = [:]
+        for label in before { finalLabels[label] = finalLabel(label) }
+
         return Identified(
             transcript: transcript, unnamed: unnamed,
             candidates: keyedCandidates.filter {
                 unnamed.contains($0.key) || keyedAutoNamed[$0.key] != nil
             },
             suggestions: keyedSuggestions,
-            autoNamed: keyedAutoNamed)
+            autoNamed: keyedAutoNamed,
+            finalLabels: finalLabels)
     }
 
     /// R24: naming is teaching. Enrollment happens here and nowhere else.
@@ -632,8 +655,15 @@ public actor JobQueue {
 
         let noteURL: URL
         if record.isDelivered {
-            let written = try await resummarise(record: record, session: session,
-                                                transcript: renamed)
+            // Naming relabels a Note; it does not rewrite one. The Summariser
+            // does put speaker labels in the prose ("Owner: Speaker 1"), so the
+            // body has to change — but by substitution, which is instant, not
+            // by a second summarising pass, which costs tens of minutes on the
+            // machine this app is shaped around and replaces prose the user has
+            // already read. `resummarise` remains for the case where the Note
+            // is no longer where it was written.
+            let written = try await rename(record: record, session: session,
+                                           transcript: renamed, names: assigned)
             updated.notePath = written.noteURL.path
             updated.transcriptPath = written.transcriptURL.path
             updated.noteHash = NamingRecord.hash(
@@ -666,8 +696,11 @@ public actor JobQueue {
         }
 
         env.transcripts.save(updated)
-        // R25: Identification has resolved, so the clips go.
-        env.clips.delete(sessionID: sessionID)
+        // The clips stay (R25 as amended). A name applied here can still turn
+        // out to be wrong — especially one Braid auto-applied — and the whole
+        // point of Re-naming is being able to listen back and fix it. They are
+        // filed under the Transcript's label, so they follow the rename.
+        env.clips.rename(sessionID: sessionID, names: assigned)
         log.notice("named \(assigned.count) speaker(s) in \(sessionID, privacy: .public)")
         return noteURL
     }
@@ -708,6 +741,9 @@ public actor JobQueue {
             noteURL = written.noteURL
         }
         env.transcripts.save(updated)
+        // Skipping still drops the clips, unlike naming. "I would rather not
+        // name these" is an explicit decision about these voices, not a maybe
+        // — so there is nothing to come back and listen to (R25).
         env.clips.delete(sessionID: sessionID)
         return noteURL
     }
@@ -732,6 +768,7 @@ public actor JobQueue {
         }
         let summary = try await env.summariser.summarise(
             transcript: transcript, session: session, preset: preset)
+        meter(summary.usage)
 
         // The Note names itself. Only while the title is still the automatic
         // stand-in: once a Session has a real title it is in the user's Vault
@@ -762,6 +799,62 @@ public actor JobQueue {
         return Delivered(written: written, session: session)
     }
 
+    /// Puts names to a delivered pair by substitution: the Transcript is
+    /// relabelled, the Note's prose has its generic labels swapped, and the
+    /// frontmatter picks up the new Participants. No model runs.
+    ///
+    /// The Note body is taken from disk rather than from the record, so edits
+    /// made in Obsidian since delivery survive the rename instead of being
+    /// clobbered — which is strictly better than the summarising path, where
+    /// the only options were to overwrite the edits or abandon the pair.
+    /// A Note that has been moved or renamed away has no body to substitute
+    /// into, and only that case falls back to summarising.
+    private func rename(record: NamingRecord, session: Session,
+                        transcript: Transcript,
+                        names: [String: String]) async throws -> VaultWriter.Written {
+        guard let vaultPath = env.settings.vaultPath else {
+            throw PipelineError.permanent("no Vault path configured")
+        }
+        let noteURL = URL(fileURLWithPath: record.notePath)
+        let transcriptURL = URL(fileURLWithPath: record.transcriptPath)
+        guard let current = try? String(contentsOf: noteURL, encoding: .utf8) else {
+            log.notice("note for \(record.id, privacy: .public) is not where it was written — summarising a new pair")
+            return try await resummarise(record: record, session: session,
+                                         transcript: transcript)
+        }
+
+        let body = Self.renaming(Self.noteBody(of: current), names)
+        let writer = VaultWriter(vaultURL: URL(fileURLWithPath: vaultPath))
+        do {
+            return try writer.overwrite(
+                noteURL: noteURL, transcriptURL: transcriptURL, session: session,
+                noteBody: body, transcript: transcript, engine: record.engine)
+        } catch {
+            throw PipelineError.permanent("Vault write: \(error.localizedDescription)")
+        }
+    }
+
+    /// The Note without the frontmatter block `VaultWriter` put on it. Anything
+    /// that does not start with one is already a body.
+    static func noteBody(of contents: String) -> String {
+        guard contents.hasPrefix("---\n") else { return contents }
+        let afterOpen = contents.index(contents.startIndex, offsetBy: 4)
+        guard let close = contents.range(of: "\n---\n",
+                                         range: afterOpen..<contents.endIndex) else {
+            return contents
+        }
+        return String(contents[close.upperBound...])
+    }
+
+    /// Longest label first, so "Speaker 1" can never match inside "Speaker 10".
+    static func renaming(_ text: String, _ names: [String: String]) -> String {
+        var out = text
+        for (label, name) in names.sorted(by: { $0.key.count > $1.key.count }) {
+            out = out.replacingOccurrences(of: label, with: name)
+        }
+        return out
+    }
+
     /// Rewrites a delivered pair in place, unless the Note has changed on disk
     /// since we wrote it — in which case a new pair is written and the user's
     /// edits are left alone (R6a).
@@ -776,6 +869,7 @@ public actor JobQueue {
         }
         let summary = try await env.summariser.summarise(
             transcript: transcript, session: session, preset: preset)
+        meter(summary.usage)
 
         let noteURL = URL(fileURLWithPath: record.notePath)
         let transcriptURL = URL(fileURLWithPath: record.transcriptPath)
@@ -798,6 +892,15 @@ public actor JobQueue {
         } catch {
             throw PipelineError.permanent("Vault write: \(error.localizedDescription)")
         }
+    }
+
+    /// R14: adds what a metered Engine just consumed to the running totals.
+    /// On-device Engines report nothing and this does nothing, which is the
+    /// honest answer for them — they cost no money.
+    func meter(_ usage: SummaryUsage?) {
+        guard let usage else { return }
+        env.settings.cloudTokensUsed += usage.promptTokens + usage.replyTokens
+        env.settings.cloudSpendUSD += usage.costUSD
     }
 
     /// Throws `.cancelled` if the user has stopped this Job. Used at the points

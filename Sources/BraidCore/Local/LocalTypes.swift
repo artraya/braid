@@ -61,13 +61,22 @@ public enum Delivery: String, Sendable, Codable, CaseIterable {
 public enum SummaryEngine: String, Sendable, Codable, CaseIterable {
     case appleBuiltIn
     case openWeights
+    /// Gemini, over the network. The only Engine whose input leaves this Mac,
+    /// and the only one fast enough to summarise a long Session in one pass
+    /// (ADR-0006 as amended).
+    case cloud
 
     public var label: String {
         switch self {
         case .appleBuiltIn: "Apple's"
         case .openWeights: "Open model"
+        case .cloud: "Gemini (cloud)"
         }
     }
+
+    /// True when this Engine sends Transcript text off the machine. The one
+    /// property the UI and the Note's frontmatter both need to be honest about.
+    public var isCloud: Bool { self == .cloud }
 }
 
 /// One speaker's turn, as the diarizer heard it.

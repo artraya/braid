@@ -565,7 +565,11 @@ private struct HistoryRoute: View {
                 ScrollView {
                     VStack(spacing: 6) {
                         ForEach(state.recentSessions) { session in
-                            SessionRow(session: session) { actions.openNote(session.notePath) }
+                            SessionRow(
+                                session: session,
+                                open: { actions.openNote(session.notePath) },
+                                rename: state.renamable.contains(session.id)
+                                    ? { model.route = .naming(session.id) } : nil)
                         }
                     }
                 }

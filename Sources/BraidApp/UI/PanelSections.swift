@@ -347,8 +347,12 @@ struct PendingRow<Actions: View>: View {
 struct SessionRow: View {
     let session: SessionRecord
     let open: () -> Void
+    /// Present while the Session's naming record is still around, which is the
+    /// window in which a wrong name can still be corrected against the voice.
+    var rename: (() -> Void)?
 
     var body: some View {
+        HStack(spacing: 6) {
         Button(action: open) {
             HStack(spacing: 12) {
                 Image(systemName: "waveform")
@@ -376,6 +380,21 @@ struct SessionRow: View {
         }
         .buttonStyle(.plain)
         .help("Open in Obsidian")
+
+        if let rename {
+            Button(action: rename) {
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.dim)
+                    .frame(width: 30, height: 30)
+                    .background(Theme.card,
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Re-name the voices in this session")
+        }
+        }
     }
 }
 

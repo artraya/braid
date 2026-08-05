@@ -114,4 +114,42 @@ public struct SettingsStore: Sendable {
         get { defaults.string(forKey: "openWeightsModel") ?? "mlx-community/Qwen3-4B-4bit" }
         nonmutating set { defaults.set(newValue, forKey: "openWeightsModel") }
     }
+
+    /// Which Gemini model writes the Note when the cloud Engine is selected.
+    public var cloudModel: GeminiSummariser.Model {
+        get {
+            guard let raw = defaults.string(forKey: "cloudModel"),
+                  let model = GeminiSummariser.Model(rawValue: raw) else { return .flashLite }
+            return model
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: "cloudModel") }
+    }
+
+    /// Dollars per million tokens for the selected cloud model. Zero by
+    /// default: the app counts tokens exactly, from the API's own reply, and
+    /// refuses to show an invented dollar figure. Fill these in from current
+    /// published pricing and the spend line starts working.
+    public var cloudRates: GeminiSummariser.Rates {
+        get {
+            GeminiSummariser.Rates(
+                inputPerMTok: defaults.double(forKey: "cloudRateInPerMTok"),
+                outputPerMTok: defaults.double(forKey: "cloudRateOutPerMTok"))
+        }
+        nonmutating set {
+            defaults.set(newValue.inputPerMTok, forKey: "cloudRateInPerMTok")
+            defaults.set(newValue.outputPerMTok, forKey: "cloudRateOutPerMTok")
+        }
+    }
+
+    /// Running totals for the cloud Engine (R14, restored with the cloud).
+    /// Tokens are always real; spend stays zero until `cloudRates` is set.
+    public var cloudTokensUsed: Int {
+        get { defaults.integer(forKey: "cloudTokensUsed") }
+        nonmutating set { defaults.set(newValue, forKey: "cloudTokensUsed") }
+    }
+
+    public var cloudSpendUSD: Double {
+        get { defaults.double(forKey: "cloudSpendUSD") }
+        nonmutating set { defaults.set(newValue, forKey: "cloudSpendUSD") }
+    }
 }

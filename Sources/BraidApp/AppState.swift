@@ -110,6 +110,8 @@ final class AppState {
         case .openWeights:
             let model = MLXSummariser.Model(rawValue: settings.openWeightsModel) ?? .qwen3_4b
             return MLXSummariser(model: model)
+        case .cloud:
+            return GeminiSummariser(model: settings.cloudModel, rates: settings.cloudRates)
         }
     }
 
@@ -119,10 +121,14 @@ final class AppState {
     func prepareLocalModels() {
         let engine = settings.localEngine
         let settings = self.settings
-        // Only Apple's engine has an availability answer; the open-weights one
-        // either downloads or reports why it could not.
-        summariserProblem = settings.summaryEngine == .appleBuiltIn
-            ? AppleSummariser.availability : nil
+        // Apple's engine and the cloud both have an availability answer — one
+        // about Apple Intelligence, one about a missing key. The open-weights
+        // one either downloads or reports why it could not.
+        switch settings.summaryEngine {
+        case .appleBuiltIn: summariserProblem = AppleSummariser.availability
+        case .cloud: summariserProblem = GeminiSummariser(model: settings.cloudModel).availability
+        case .openWeights: summariserProblem = nil
+        }
         let openWeights: MLXSummariser? = settings.summaryEngine == .openWeights
             ? MLXSummariser(model: MLXSummariser.Model(rawValue: settings.openWeightsModel) ?? .qwen3_4b)
             : nil
@@ -231,8 +237,11 @@ final class AppState {
         refreshNamingState()
         refreshSessions()
         refreshPeople()
-        // Clips belong to a Session still expecting names; anything else is
-        // audio with no reason to exist (R25).
+        refreshCloudKeyState()
+        // Clips belong to a Session whose naming record is still around, named
+        // or not — that is the window in which Re-naming can reach it. Once the
+        // record ages out at 30 days the clips are audio with no reason to
+        // exist, and `purgeExpired` above has just made them orphans (R25).
         clips.purgeOrphans(keeping: Set(transcripts.all().map(\.id)))
         Task {
             await queue.loadPersisted()
@@ -319,7 +328,53 @@ final class AppState {
     }
 
     func refreshNamingState() {
-        awaitingNames = transcripts.all().filter { !$0.namesApplied }
+        let all = transcripts.all()
+        awaitingNames = all.filter { !$0.namesApplied }
+        // Every record still inside its retention window can be re-opened, not
+        // just the ones still asking. A name Braid applied on its own
+        // confidence is the one kind that reaches the Vault without anybody
+        // checking it, so noticing it was wrong a week later has to lead
+        // somewhere.
+        renamable = Set(all.map(\.id))
+    }
+
+    /// Session ids whose naming record is still around, so History can offer
+    /// Re-name. Ids rather than records: the row only needs to know whether the
+    /// button belongs there.
+    var renamable: Set<String> = [] { didSet { onChange?() } }
+
+    var cloudTokensUsed: Int { settings.cloudTokensUsed }
+
+    /// What the cloud has consumed. Tokens always, because they are measured;
+    /// dollars only once someone has filled in a rate, because an invented
+    /// figure is worse than none (R14).
+    var cloudUsageLine: String {
+        let tokens = settings.cloudTokensUsed
+        let formatted = tokens.formatted(.number.grouping(.automatic))
+        guard settings.cloudSpendUSD > 0 else {
+            return "\(formatted) tokens so far. Set a rate in Settings to see spend."
+        }
+        return String(format: "%@ tokens so far · $%.2f", formatted, settings.cloudSpendUSD)
+    }
+
+    /// True when a Gemini key is stored. The key itself is never read into the
+    /// UI — Settings can set or clear it, never display it.
+    ///
+    /// Cached, and deliberately not a computed property that asks the store.
+    /// Reading it unseals a file with the Keychain-held key, and a SwiftUI body
+    /// is evaluated far too often for that: as a computed property it hit the
+    /// Keychain on every re-render, and in a headless render with no window
+    /// server to show an authorisation prompt it simply never returned.
+    private(set) var hasCloudKey = false { didSet { onChange?() } }
+
+    func refreshCloudKeyState() {
+        hasCloudKey = APIKeyStore().hasKey
+    }
+
+    func setCloudKey(_ value: String) {
+        APIKeyStore().save(value)
+        refreshCloudKeyState()
+        prepareLocalModels()
     }
 
     func refreshSessions() {

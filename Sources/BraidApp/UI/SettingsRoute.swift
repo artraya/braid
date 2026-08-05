@@ -22,6 +22,14 @@ final class SettingsFormModel {
     var localEngine: LocalEngine = .apple
     var holdForNames = false
     var summaryEngine: SummaryEngine = .appleBuiltIn
+
+    static func summaryNote(for engine: SummaryEngine) -> String {
+        switch engine {
+        case .appleBuiltIn: "On this Mac. Free, but slow on long calls and refuses some subjects."
+        case .openWeights: "On this Mac. Refuses nothing, 2.3GB, and very slow on 8GB."
+        case .cloud: "Seconds instead of minutes, and reads a whole meeting in one pass."
+        }
+    }
     /// Which groups are open. Held here rather than in `@State` so the views
     /// stay pure functions of a model (ADR-0004), and so reopening Settings
     /// does not fold everything up again mid-task.
@@ -80,6 +88,10 @@ struct SettingsRoute: View {
     let state: AppState
     let model: SessionsPanelModel
     let actions: PanelActions
+
+    /// Never holds the stored key — only what is being typed on the way in.
+    /// Cleared the moment it is saved, so the panel is not a place a key sits.
+    @State private var cloudKeyDraft = ""
 
     private var form: SettingsFormModel { model.settingsForm }
 
@@ -244,17 +256,67 @@ struct SettingsRoute: View {
                 .font(.system(size: 11))
             }
 
-            Field("Summaries", note: form.summaryEngine == .appleBuiltIn
-                  ? "Free and instant, but refuses some subjects."
-                  : "Refuses nothing, reads a whole meeting at once. 2.3GB.") {
+            Field("Summaries", note: SettingsFormModel.summaryNote(for: form.summaryEngine)) {
+                // A menu, not segments. Three options do not fit side by side
+                // at Theme.panelWidth, and a segmented control does not shrink
+                // below its content — it overflows the panel and takes every
+                // other row with it. The Preset picker above is a menu for the
+                // same reason.
                 Picker("", selection: binding(\.summaryEngine)) {
                     ForEach(SummaryEngine.allCases, id: \.self) { engine in
                         Text(engine.label).tag(engine)
                     }
                 }
                 .labelsHidden()
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .font(.system(size: 11))
+            }
+
+            // The one Engine whose input leaves the Mac says so here, every
+            // time, rather than in a document nobody re-reads.
+            if form.summaryEngine.isCloud {
+                Label("""
+                    Transcript text is sent to Google. Audio, voiceprints and \
+                    voice clips never leave this Mac.
+                    """, systemImage: "arrow.up.forward.app")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                if state.cloudTokensUsed > 0 {
+                    Text(state.cloudUsageLine)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.faint)
+                }
+                Field("Gemini API key",
+                      note: state.hasCloudKey
+                        ? "Stored in this Mac's Keychain. Type a new one to replace it."
+                        : "Required before the cloud can write a note.") {
+                    // Stacked, not side by side: a field and two buttons in a row
+                    // do not fit at Theme.panelWidth (see the note on it).
+                    VStack(alignment: .leading, spacing: 6) {
+                        SecureField("Paste a key", text: $cloudKeyDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                            .frame(maxWidth: .infinity)
+                        HStack(spacing: 6) {
+                            Button("Save") {
+                                state.setCloudKey(cloudKeyDraft)
+                                cloudKeyDraft = ""
+                            }
+                            .font(.system(size: 11))
+                            .disabled(cloudKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                            if state.hasCloudKey {
+                                Button("Remove") {
+                                    state.setCloudKey("")
+                                    cloudKeyDraft = ""
+                                }
+                                .font(.system(size: 11))
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
             }
 
             if let progress = state.modelDownload {

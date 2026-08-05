@@ -10,10 +10,29 @@ public struct SummaryOutput: Sendable {
     /// vetted by `Session.cleanTitle`. Nil when it offered nothing usable, or
     /// when the note came from a salvage path that never got to ask.
     public let title: String?
+    /// What the call consumed, when the Engine meters anything. Nil for every
+    /// on-device Engine, because nothing they do costs money (R14).
+    public let usage: SummaryUsage?
 
-    public init(noteBody: String, title: String? = nil) {
+    public init(noteBody: String, title: String? = nil, usage: SummaryUsage? = nil) {
         self.noteBody = noteBody
         self.title = title
+        self.usage = usage
+    }
+}
+
+/// Tokens one metered summarising call consumed, and what they cost.
+public struct SummaryUsage: Sendable, Equatable, Codable {
+    public var promptTokens: Int
+    public var replyTokens: Int
+    /// Dollars, already converted at the model's rate by whoever made the call:
+    /// the rate belongs to the Engine, not to the pipeline that stores this.
+    public var costUSD: Double
+
+    public init(promptTokens: Int = 0, replyTokens: Int = 0, costUSD: Double = 0) {
+        self.promptTokens = promptTokens
+        self.replyTokens = replyTokens
+        self.costUSD = costUSD
     }
 }
 

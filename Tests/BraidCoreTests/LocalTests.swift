@@ -319,6 +319,102 @@ import FluidAudio
     #expect(stillHeld.isEmpty)
 }
 
+/// Naming a Session that already delivered relabels its Note; it does not
+/// summarise it again. Re-summarising cost tens of minutes on the machine this
+/// app targets, and it replaced prose the owner had already read — including
+/// any edits they had made in Obsidian since.
+@Test func namingADeliveredSessionSubstitutesRatherThanResummarising() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let summariser = CountingSummary(body: "- Re-import the control file (Owner: Speaker 1)")
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root, summariser: summariser) {
+        disclosed.record($0)
+    }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    let delivered = try await disclosed.waitForNote()
+    #expect(summariser.calls == 1)
+
+    // An edit the owner made in Obsidian after delivery.
+    let edited = try String(contentsOf: delivered, encoding: .utf8)
+        + "\n- My own note: chase this with Speaker 1.\n"
+    try edited.write(to: delivered, atomically: true, encoding: .utf8)
+
+    let note = try await queue.applyNames(sessionID: session.id,
+                                          names: ["Speaker 1": "John Davis"])
+
+    // The model never ran again.
+    #expect(summariser.calls == 1)
+
+    let written = try String(contentsOf: note, encoding: .utf8)
+    #expect(written.contains("Owner: John Davis"))
+    #expect(!written.contains("Speaker 1"))
+    // The owner's edit survived the rename, relabelled along with the rest.
+    #expect(written.contains("My own note: chase this with John Davis."))
+    // The named voice is a Participant now, so the frontmatter says so (R10).
+    #expect(written.contains("participants: [John Davis]"))
+
+    let transcript = try String(
+        contentsOf: URL(fileURLWithPath: env.transcripts.load(session.id)!.transcriptPath),
+        encoding: .utf8)
+    #expect(transcript.contains("John Davis"))
+}
+
+/// R14: only an Engine that reports usage moves the counters. The on-device
+/// ones report nothing and must leave the totals alone rather than writing
+/// zeroes over them — "no cost" and "cost of zero" look the same in a number
+/// but not in a running total.
+@Test func meteringAccumulatesOnlyWhatAnEngineReports() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+
+    // The stub Summariser reports nothing, like every on-device Engine.
+    await queue.enqueue(session: try seedSession(root: root), remoteSilent: false)
+    _ = try await disclosed.waitForNote()
+    #expect(env.settings.cloudTokensUsed == 0)
+    #expect(env.settings.cloudSpendUSD == 0)
+
+    // A metered Engine's numbers land, and a second call adds to the first.
+    await queue.meter(SummaryUsage(promptTokens: 27_727, replyTokens: 449, costUSD: 0.0031))
+    await queue.meter(SummaryUsage(promptTokens: 1_000, replyTokens: 100, costUSD: 0.0001))
+    #expect(env.settings.cloudTokensUsed == 29_276)
+    #expect(abs(env.settings.cloudSpendUSD - 0.0032) < 0.000001)
+}
+
+/// Tokens are read straight from the provider's own accounting, and a rate of
+/// zero means the app reports tokens rather than inventing a dollar figure.
+@Test func geminiReadsUsageFromTheReplyAndOnlyCostsWhenRated() {
+    let reply: [String: Any] = ["usageMetadata": ["promptTokenCount": 27_727,
+                                                  "candidatesTokenCount": 449]]
+    let unrated = GeminiSummariser.usage(from: reply, at: .init())
+    #expect(unrated.promptTokens == 27_727)
+    #expect(unrated.replyTokens == 449)
+    #expect(unrated.costUSD == 0, "no rate configured means no dollar figure")
+
+    let rated = GeminiSummariser.usage(
+        from: reply, at: .init(inputPerMTok: 0.10, outputPerMTok: 0.40))
+    #expect(abs(rated.costUSD - (27_727 * 0.10 + 449 * 0.40) / 1_000_000) < 1e-12)
+
+    // A reply with no usage block is zero, not a crash.
+    #expect(GeminiSummariser.usage(from: [:], at: .init()) == SummaryUsage())
+}
+
+/// "Speaker 1" must not match inside "Speaker 10".
+@Test func renamingNeverMatchesOneLabelInsideAnother() {
+    let renamed = JobQueue.renaming(
+        "Speaker 1 asked; Speaker 10 answered.",
+        ["Speaker 1": "Ana", "Speaker 10": "Bo"])
+    #expect(renamed == "Ana asked; Bo answered.")
+}
+
 /// R26: Held never waits when it has nothing to ask. A voice the database
 /// already knows is named without anyone being interrupted.
 @Test func heldDeliveryWithEverySpeakerMatchedDeliversImmediately() async throws {
@@ -349,6 +445,62 @@ import FluidAudio
     #expect(transcript.contains("Sarah"), "a recognised voice is named without being asked")
     #expect(!transcript.contains("Speaker 1"))
     #expect(note.lastPathComponent.hasSuffix(".md"))
+}
+
+/// R25 as amended: a voice Braid named on its own confidence gets a Voice Clip
+/// too, filed under the name it was given. Nobody was asked about that name, so
+/// listening back is the only way to catch it being wrong — and the clip has to
+/// survive delivery, or Re-naming has nothing to play.
+@Test func anAutoNamedVoiceKeepsAClipFiledUnderItsName() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let known = unitVector(seed: 3)
+    let box = SecretBox.ephemeral()
+    let voices = VoiceStore(url: root.appendingPathComponent("voices.dat"), box: box)
+    await voices.enroll(SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60), as: "Sarah")
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(
+        root: root, box: box, voices: voices,
+        diarizer: StubDiarizer(
+            spans: [SpeakerSpan(speakerId: "S0", start: 0, end: 3)],
+            voices: [SpeakerVoice(speakerId: "S0", centroid: known, seconds: 60)])
+    ) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    _ = try await disclosed.waitForNote()
+
+    // Under the name, not under "Speaker 1" — that is the label the naming
+    // view looks a clip up by.
+    #expect(env.clips.clip(for: "Sarah", sessionID: session.id) != nil)
+    #expect(env.clips.clip(for: "Speaker 1", sessionID: session.id) == nil)
+}
+
+/// Naming no longer throws the clips away. A name can be wrong, and correcting
+/// it weeks later is the whole point of keeping them (R25 as amended).
+@Test func namingKeepsTheClipsForLaterCorrection() async throws {
+    let root = tempRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let disclosed = Disclosures()
+    let env = try makeLocalEnvironment(root: root, delivery: .held) { disclosed.record($0) }
+    let queue = JobQueue(env: env)
+    let session = try seedSession(root: root)
+
+    await queue.enqueue(session: session, remoteSilent: false)
+    try await disclosed.waitForHold()
+    #expect(env.clips.clip(for: "Speaker 1", sessionID: session.id) != nil)
+
+    _ = try await queue.applyNames(sessionID: session.id, names: ["Speaker 1": "Sarah"])
+
+    // The record survives so History can re-open it, and so does the audio.
+    let record = env.transcripts.load(session.id)
+    #expect(record?.namesApplied == true)
+    #expect(env.clips.clip(for: "Sarah", sessionID: session.id) != nil,
+            "the clip follows the name it was filed under")
 }
 
 /// R25: skipping resolves Identification just as naming does — the clips go,
@@ -527,6 +679,23 @@ final class StubSummary: NoteSummarising, @unchecked Sendable {
     func summarise(transcript: Transcript, session: Session,
                    preset: Preset) async throws -> SummaryOutput {
         SummaryOutput(noteBody: "# Local note")
+    }
+}
+
+/// A Summariser that says how many times it ran, so a test can prove a path
+/// never reached the model.
+final class CountingSummary: NoteSummarising, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls = 0
+    let body: String
+    var calls: Int { lock.withLock { _calls } }
+
+    init(body: String) { self.body = body }
+
+    func summarise(transcript: Transcript, session: Session,
+                   preset: Preset) async throws -> SummaryOutput {
+        lock.withLock { _calls += 1 }
+        return SummaryOutput(noteBody: body)
     }
 }
 

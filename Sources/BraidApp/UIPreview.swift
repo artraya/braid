@@ -66,6 +66,13 @@ enum UIPreview {
                                                recording: .recording)),
             ("settings", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                               route: .settings)),
+            // Expanded, because that is where a control wide enough to burst
+            // the panel actually shows up — a collapsed group hides its own
+            // layout bug, and this case exists because one got shipped that way.
+            ("settings expanded",
+             SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                  route: .settings,
+                                  openSettingsGroups: ["Notes", "Voices", "Models", "Recording"])),
             ("history", SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                              route: .history)),
         ]
@@ -159,6 +166,13 @@ enum UIPreview {
                                    route: .settings,
                                    openSettingsGroups: ["Notes", "Models"]),
               named: "panel-settings-open", into: directory)
+        // The cloud Engine selected, because it is the only one that adds rows
+        // of its own and they have the least room left to fit in.
+        write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
+                                   route: .settings,
+                                   openSettingsGroups: ["Models"],
+                                   cloudSummaries: true),
+              named: "panel-settings-cloud", into: directory)
         write(SessionsPanelPreview(sessions: previewSessions, usage: previewUsage,
                                    route: .history),
               named: "panel-history", into: directory)
@@ -304,6 +318,9 @@ private struct SessionsPanelPreview: View {
     var route: SessionsPanelModel.Route = .main
     var awaitingNames: [NamingRecord] = []
     var openSettingsGroups: Set<String> = []
+    /// Selects the cloud Summariser, which is the only Engine with extra rows
+    /// of its own — the disclosure about what leaves the Mac, and the key field.
+    var cloudSummaries = false
 
     var body: some View {
         let state = UIPreview.scratchState()
@@ -319,6 +336,7 @@ private struct SessionsPanelPreview: View {
             state.recordingStartedAt = Date().addingTimeInterval(-736)
         }
         state.knownPeople = knownPeople
+        if cloudSummaries { state.settings.summaryEngine = .cloud }
         let model = SessionsPanelModel()
         model.chosenPeople = chosenPeople
         if let speakerCount { model.selectSpeakerCount(speakerCount) }

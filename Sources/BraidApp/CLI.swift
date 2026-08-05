@@ -11,6 +11,22 @@ func eprintLine(_ message: String) {
 func runCLI() -> Bool {
     let args = CommandLine.arguments
 
+if let i = args.firstIndex(of: "--set-gemini-key") {
+    // --set-gemini-key <key>   stores it in the Keychain, ThisDeviceOnly.
+    // An empty string clears it, which is how the cloud Engine gets turned off
+    // properly rather than just deselected.
+    guard args.count > i + 1 else {
+        eprintLine("usage: --set-gemini-key <key>   (empty string removes it)")
+        exit(2)
+    }
+    let store = APIKeyStore()
+    store.save(args[i + 1])
+    print(store.hasKey
+          ? "Gemini key stored, sealed with this Mac's Keychain key."
+          : "Gemini key removed.")
+    exit(0)
+}
+
 if args.contains("--ui-preview") {
     // Layout check for the panel; invents its own data, touches nothing.
     let directory = args.firstIndex(of: "--snapshot").flatMap { i in
@@ -60,12 +76,17 @@ if let i = args.firstIndex(of: "--summary-check") {
         eprintLine("usage: --summary-check <text-file>")
         exit(2)
     }
-    if let problem = AppleSummariser.availability {
+    // --cloud [model-id] summarises with Gemini. Checked before Apple's
+    // availability, because a machine with Apple Intelligence switched off can
+    // still perfectly well use the cloud path.
+    let cloud = args.contains("--cloud")
+    if !cloud, let problem = AppleSummariser.availability, !args.contains("--mlx") {
         eprintLine(problem)
         exit(1)
     }
     AppleSummariser.verbose = true
     MLXSummariser.verbose = true
+    GeminiSummariser.verbose = true
     let probing = args.contains("--probe")
     // --mlx [model-id] summarises with the open-weights model instead, which is
     // the whole point of it existing: a session Apple refuses on subject should
@@ -101,14 +122,34 @@ if let i = args.firstIndex(of: "--summary-check") {
             return
         }
         do {
-            let summariser: any NoteSummarising = mlxModel.map { MLXSummariser(model: $0) }
-                ?? AppleSummariser()
-            if let mlxModel {
+            let summariser: any NoteSummarising
+            if cloud {
+                let model = args.firstIndex(of: "--cloud").flatMap { i in
+                    args.count > i + 1 ? GeminiSummariser.Model(rawValue: args[i + 1]) : nil
+                } ?? .flashLite
+                let gemini = GeminiSummariser(model: model)
+                if let problem = gemini.availability {
+                    eprintLine(problem)
+                    code = 1
+                    semaphore.signal()
+                    return
+                }
+                print("engine: \(model.label) — this sends the transcript to Google")
+                summariser = gemini
+            } else if let mlxModel {
                 print("engine: \(mlxModel.label) (~\(mlxModel.approximateGB)GB), first run downloads it")
+                summariser = MLXSummariser(model: mlxModel)
+            } else {
+                summariser = AppleSummariser()
             }
+            let started = Date()
             let output = try await summariser.summarise(
                 transcript: Transcript(utterances: utterances), session: session,
                 preset: Preset.defaults[0])
+            print(String(format: "took: %.1fs", Date().timeIntervalSince(started)))
+            if let usage = output.usage {
+                print("tokens: \(usage.promptTokens) prompt + \(usage.replyTokens) reply")
+            }
             let declined = output.noteBody == AppleSummariser.declinedBody
             print(declined ? "DECLINED — the model refused this content"
                            : "SUMMARISED")

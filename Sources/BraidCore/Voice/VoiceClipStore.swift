@@ -129,6 +129,23 @@ public struct VoiceClipStore: Sendable {
         try? FileManager.default.removeItem(at: root.appendingPathComponent(sessionID))
     }
 
+    /// Follows a rename, because clips are filed under the label the Transcript
+    /// uses and naming changes that label. Without this a clip cut as
+    /// "Speaker 1" is invisible the moment it becomes "Sarah", and Re-naming
+    /// has nothing to play back.
+    public func rename(sessionID: String, names: [String: String]) {
+        let directory = root.appendingPathComponent(sessionID)
+        for (from, to) in names {
+            let old = directory.appendingPathComponent("\(safe(from)).caf")
+            let new = directory.appendingPathComponent("\(safe(to)).caf")
+            guard old != new, FileManager.default.fileExists(atPath: old.path) else { continue }
+            // Two voices given the same name merge in the Transcript; let the
+            // clips merge the same way rather than leaving a stray file.
+            try? FileManager.default.removeItem(at: new)
+            try? FileManager.default.moveItem(at: old, to: new)
+        }
+    }
+
     /// Clips whose Session no longer expects a name — a record that aged out,
     /// or a Job discarded — have nothing to be played in. Cheap; called at launch.
     public func purgeOrphans(keeping live: Set<String>) {

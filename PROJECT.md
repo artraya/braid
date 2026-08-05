@@ -8,7 +8,8 @@ Braid records a call as two audio tracks on macOS, transcribes and separates the
 voices on-device, summarises on-device, and writes a markdown note plus
 transcript into the owner's Obsidian vault. It exists so a low-spec machine in a
 headphones-wearing office can get accurate, speaker-attributed meeting notes with
-near-zero involvement: click record, get a note. Nothing it hears leaves the Mac.
+near-zero involvement: click record, get a note. The audio it hears never leaves
+the Mac, and neither does anything that could identify a voice.
 
 ## Current direction
 
@@ -16,14 +17,21 @@ The app works and is in daily use (see ADOPTION.md). Attribution quality shipped
 (v0.3.0–v0.4.0); local transcription and diarization shipped behind a Provider
 seam alongside the cloud.
 
-The theme is now **a private app that learns the voices you meet**. Two decisions
-made it one piece of work rather than two. Braid is going private and
-single-owner, which makes storing voiceprints a reasonable thing to do
-([ADR-0007](docs/adr/0007-the-voice-database.md)) — and that is only honest if
-nothing derived from a voice can leave, so the cloud goes entirely
+The theme is now **a private app that learns the voices you meet**. Braid is
+private and single-owner, which makes storing voiceprints a reasonable thing to
+do ([ADR-0007](docs/adr/0007-the-voice-database.md)), and everything that could
+identify a voice stays on this machine
 ([ADR-0006](docs/adr/0006-zero-cloud.md)). Success looks like: the people you
-meet every week stop arriving as "Speaker 1", the app costs nothing to run, and
-no note or recording or voiceprint has ever been anywhere but this machine.
+meet every week stop arriving as "Speaker 1", and no recording, embedding or
+voiceprint has ever been anywhere but here.
+
+**Summarisation is the one deliberate exception, taken on measurement**
+([ADR-0008](docs/adr/0008-cloud-summarisation.md)). The on-device models took 23
+to 49 minutes on an 86-minute call, and both had to cut the Transcript into
+pieces small enough to fit — which lost most of the meeting. Transcript text now
+goes to a cloud model in one pass and comes back in seconds. Audio, embeddings,
+voiceprints and voice clips still never travel, and picking a local Engine turns
+the network off again.
 
 The measured cost of that trade is worse speaker attribution today than
 AssemblyAI gave (61–71% turn purity against it), taken deliberately on the bet
@@ -34,8 +42,13 @@ recurring speakers. That bet is what the current cycle has to prove.
 
 - **No calendar, EventKit, Graph or Teams integration. Ever.** Identity comes
   from voices and the owner's own naming, never an external roster.
-- **No cloud services.** No STT API, no LLM API, no telemetry, no sync. The only
-  network use is fetching Engine model assets (ADR-0006).
+- **Nothing that identifies a voice leaves the machine.** No audio, no
+  embedding, no Voiceprint, no Voice Clip, no telemetry, no sync. Transcription,
+  diarization and identification are on-device and stay there (ADR-0006).
+  Summarisation is the one exception and it is a deliberate one: Transcript text
+  may be sent to a cloud model, because the on-device models take 23 to 49
+  minutes on this machine and have to cut a long meeting into pieces to fit
+  (ADR-0008). Selecting a local Engine turns that off with no code change.
 - Third-party dependencies are a deliberate, recorded decision, never routine
   (ADR-0004 as amended by ADR-0005 and ADR-0006). Two are accepted, both pinned
   exactly: FluidAudio for local ASR and diarization, and mlx-swift-examples for
